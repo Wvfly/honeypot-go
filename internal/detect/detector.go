@@ -6,14 +6,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honeypot-go/internal/config"
 	"honeypot-go/internal/event"
 )
+
+// notifyQueueCap Webhook 推送队列上限：Webhook 慢时宁可丢弃推送也不堆积 goroutine
+const notifyQueueCap = 64
+
+// busDropMonitorInterval 事件总线丢弃计数检查周期：总线队列满而被丢弃的事件
+// 意味着检测/存储链路处理不及（典型是被攻击者刷海量命令淹没），需及时告警。
+const busDropMonitorInterval = 30 * time.Second
 
 // connState 单个连接（攻击源）的风险状态
 type connState struct {
@@ -33,10 +42,12 @@ type Detector struct {
 	bus    *event.Bus
 	logger *slog.Logger
 
-	mu       sync.Mutex
-	conns    map[string]*connState
-	sessConn map[string]string // session_id -> connection_id
-	client   *http.Client
+	mu            sync.Mutex
+	conns         map[string]*connState
+	sessConn      map[string]string // session_id -> connection_id
+	client        *http.Client
+	notifyCh      chan event.Event // 有界 Webhook 推送队列
+	droppedAlerts atomic.Uint64    // 队列满被丢弃的推送数
 }
 
 // New 创建检测器
@@ -48,6 +59,7 @@ func New(cfg config.DetectConfig, bus *event.Bus, logger *slog.Logger) *Detector
 		conns:    make(map[string]*connState),
 		sessConn: make(map[string]string),
 		client:   &http.Client{Timeout: 5 * time.Second},
+		notifyCh: make(chan event.Event, notifyQueueCap),
 	}
 }
 
@@ -55,10 +67,48 @@ func New(cfg config.DetectConfig, bus *event.Bus, logger *slog.Logger) *Detector
 func (d *Detector) Run(ctx context.Context) {
 	ch := d.bus.Subscribe()
 	defer d.bus.Unsubscribe(ch)
+	// Webhook 单 worker 串行推送：告警风暴时队列满即丢弃（计数），避免 goroutine 无限堆积
+	go d.webhookWorker(ctx)
+	// 监控事件总线丢弃：检测链路被事件风暴淹没时"失明"，运营方无感知
+	go d.monitorBusDropped(ctx)
 	for {
 		select {
 		case ev := <-ch:
 			d.handle(ev)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// monitorBusDropped 周期检查事件总线丢弃计数。窗口内丢弃数增长说明有消费者
+// （检测/存储）处理不及，通常是攻击者刷海量命令/事件试图淹没分析链路——
+// 这是检测"失明"的前兆。发现时发布 event_bus_overload 告警（入库 + Webhook），
+// 与普通攻击告警形成闭环。告警自身也走同一总线：总线满时可能被丢，但日志始终可见。
+func (d *Detector) monitorBusDropped(ctx context.Context) {
+	t := time.NewTicker(busDropMonitorInterval)
+	defer t.Stop()
+	var last uint64
+	for {
+		select {
+		case <-t.C:
+			cur := d.bus.Dropped()
+			if cur <= last {
+				last = cur
+				continue
+			}
+			drop := cur - last
+			last = cur
+			d.bus.Publish(event.New(event.TypeAlert, map[string]any{
+				"rule_name":         "event_bus_overload",
+				"severity":          "medium",
+				"source_ip":         "internal",
+				"evidence":          fmt.Sprintf("event bus dropped %d events in last window (total %d)", drop, cur),
+				"dropped_in_window": drop,
+			}))
+			d.logger.Warn("event bus dropping events, detection may be degraded",
+				"dropped_in_window", drop,
+				"dropped_total", cur)
 		case <-ctx.Done():
 			return
 		}
@@ -108,6 +158,12 @@ func (d *Detector) handle(ev event.Event) {
 	case event.TypeSessionOpened:
 		d.mu.Lock()
 		d.sessConn[eventStr(ev, "session_id")] = eventStr(ev, "connection_id")
+		d.mu.Unlock()
+
+	case event.TypeSessionClosed:
+		// 会话关闭即删除映射，防止 map 只增不减导致内存泄漏
+		d.mu.Lock()
+		delete(d.sessConn, eventStr(ev, "session_id"))
 		d.mu.Unlock()
 
 	case event.TypeCommandExecuted, event.TypeDownloadAttempt,
@@ -182,7 +238,29 @@ func (d *Detector) alert(ev event.Event, st *connState, r Rule) {
 		"connection_id", st.connID,
 	)
 	if d.cfg.WebhookURL != "" {
-		go d.notify(alertEv)
+		d.enqueueNotify(alertEv)
+	}
+}
+
+// enqueueNotify 非阻塞入队 Webhook 推送；队列满则丢弃并计数
+func (d *Detector) enqueueNotify(ev event.Event) {
+	select {
+	case d.notifyCh <- ev:
+	default:
+		d.droppedAlerts.Add(1)
+		d.logger.Warn("webhook queue full, alert notification dropped", "rule", eventStr(ev, "rule_name"))
+	}
+}
+
+// webhookWorker 串行消费告警推送，防止 Webhook 慢时 goroutine 无限堆积
+func (d *Detector) webhookWorker(ctx context.Context) {
+	for {
+		select {
+		case ev := <-d.notifyCh:
+			d.notify(ev)
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -202,7 +280,7 @@ func (d *Detector) finalReport(ev event.Event, st *connState) {
 		"evidence":      "total score for session",
 	}))
 	if d.cfg.WebhookURL != "" {
-		d.notify(event.New(event.TypeAlert, map[string]any{
+		d.enqueueNotify(event.New(event.TypeAlert, map[string]any{
 			"connection_id": st.connID,
 			"source_ip":     st.sourceIP,
 			"rule_name":     "session_risk_summary",

@@ -58,6 +58,8 @@ storage:
   data_dir: "data"
   # 存储驱动: sqlite | jsonl（sqlite 为主存储，jsonl 为原始事件流水，二者可同时启用，逗号分隔）
   driver: "sqlite,jsonl"
+  # 数据保留天数：超过后清理 SQLite 旧记录与过期 JSONL 流水（0 = 不清理，注意可能耗尽磁盘）
+  retention_days: 30
 
 detect:
   # 行为分析：规则引擎 + 连接级风险评分 + 告警

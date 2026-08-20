@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 const (
 	flushInterval = 250 * time.Millisecond
 	flushBatch    = 128
+	// cleanupInterval 过期数据清理周期（SQLite 旧记录 + 过期 JSONL）
+	cleanupInterval = 6 * time.Hour
 )
 
 // Store 事件消费者：把事件总线上的事件持久化到 SQLite（结构化表）+ JSONL（原始流水）。
@@ -40,16 +43,20 @@ type Store struct {
 
 // New 创建存储（自动建目录与表）
 func New(cfg config.StorageConfig, bus *event.Bus, logger *slog.Logger) (*Store, error) {
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	// 数据目录含明文口令与全部命令记录，权限收紧到仅属主可访问
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	s := &Store{cfg: cfg, bus: bus, logger: logger}
 
 	if cfg.UseSQLite() {
-		db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "honeypot.db"))
+		dbPath := filepath.Join(cfg.DataDir, "honeypot.db")
+		db, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("open sqlite: %w", err)
 		}
+		// SQLite 建库文件默认权限过宽（0666&umask），收紧到 0600
+		_ = os.Chmod(dbPath, 0o600)
 		// 单写者，避免写锁冲突
 		db.SetMaxOpenConns(1)
 		s.db = db
@@ -59,7 +66,7 @@ func New(cfg config.StorageConfig, bus *event.Bus, logger *slog.Logger) (*Store,
 		}
 	}
 	if cfg.UseJSONL() {
-		s.jl = &jsonlWriter{dir: filepath.Join(cfg.DataDir, "events")}
+		s.jl = &jsonlWriter{dir: filepath.Join(cfg.DataDir, "events"), retentionDays: cfg.RetentionDays}
 	}
 	return s, nil
 }
@@ -84,6 +91,8 @@ func (s *Store) Run(ctx context.Context) {
 
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -94,6 +103,8 @@ func (s *Store) Run(ctx context.Context) {
 			}
 		case <-ticker.C:
 			flush()
+		case <-cleanupTicker.C:
+			s.cleanupOldRows()
 		case <-ctx.Done():
 			// 兜底处理剩余事件
 			for {
@@ -291,10 +302,33 @@ func (s *Store) insertCommand(tx *sql.Tx, ev event.Event) {
 		ev.Data["exit_code"], ev.Data["duration_ms"], ev.Data["output_preview"])
 }
 
+// cleanupOldRows 按保留期删除 SQLite 中的旧记录，防止长期运行耗尽磁盘。
+// 事件时间戳为 RFC3339Nano 文本，同一时区下字符串序与时间序一致，取
+// "YYYY-MM-DDTHH:MM:SS" 前缀做边界（保留期含 cutoff 当天，近似即可）。
+func (s *Store) cleanupOldRows() {
+	if s.db == nil || s.cfg.RetentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -s.cfg.RetentionDays).Format("2006-01-02T00:00:00")
+	for _, q := range []string{
+		`DELETE FROM auth_attempts WHERE ts < ?`,
+		`DELETE FROM commands WHERE ts < ?`,
+		`DELETE FROM events WHERE ts < ?`,
+		`DELETE FROM sessions WHERE opened_at < ?`,
+		`DELETE FROM connections WHERE opened_at < ?`,
+	} {
+		if _, err := s.db.Exec(q, cutoff); err != nil {
+			s.logger.Warn("cleanup old rows failed", "query", q, "error", err)
+		}
+	}
+}
+
 // --- JSONL 原始事件流水 ---
 
 type jsonlWriter struct {
 	dir string
+	// retentionDays 保留天数：<=0 表示不清理
+	retentionDays int
 
 	mu  sync.Mutex
 	f   *os.File
@@ -319,10 +353,11 @@ func (w *jsonlWriter) write(ev event.Event) error {
 }
 
 func (w *jsonlWriter) rotate(day string) error {
-	if err := os.MkdirAll(w.dir, 0o755); err != nil {
+	// 原始事件流水含明文口令，目录与文件权限收紧
+	if err := os.MkdirAll(w.dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(w.dir, day+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(filepath.Join(w.dir, day+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -331,7 +366,30 @@ func (w *jsonlWriter) rotate(day string) error {
 	}
 	w.f = f
 	w.day = day
+	w.cleanup()
 	return nil
+}
+
+// cleanup 删除超过保留期的过期 JSONL 流水（文件名即日期，字典序即时间序）。
+func (w *jsonlWriter) cleanup() {
+	if w.retentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -w.retentionDays).Format("2006-01-02")
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		day := strings.TrimSuffix(name, ".jsonl")
+		if day < cutoff {
+			_ = os.Remove(filepath.Join(w.dir, name))
+		}
+	}
 }
 
 func (w *jsonlWriter) close() error {

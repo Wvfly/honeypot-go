@@ -27,6 +27,7 @@ host_key.pub
 # 根目录 Linux 交叉编译产物
 /honeypot-linux-*
 /ttyshow-linux-*
+/dbquery-*
 # 根目录无扩展名二进制（锚定根，避免误伤 cmd/honeypot/ 源码目录）
 /honeypot
 /ttyshow

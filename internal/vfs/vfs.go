@@ -252,6 +252,9 @@ func (fs *FileSystem) IsDir(path string) bool {
 	return ok && n.isDir
 }
 
+// maxFileSize 单文件写入大小上限：防止恶意超大写入撑爆内存（与 sftp 上传上限一致）
+const maxFileSize = 64 << 20 // 64 MiB
+
 // WriteFile 覆盖写入（父目录必须存在），M2 用于 echo > / wget 落盘
 func (fs *FileSystem) WriteFile(path string, data []byte) error {
 	return fs.write(path, data, false)
@@ -277,6 +280,10 @@ func (fs *FileSystem) write(path string, data []byte, appendMode bool) error {
 		}
 		dir = next
 	}
+	// 权限校验：目标所在目录需有写权限（owner/group/other 任一写位）
+	if !permWritable(dir.perm) {
+		return fmt.Errorf("permission denied: directory %q is read-only", dir.name)
+	}
 	name := parts[len(parts)-1]
 	n, exists := dir.children[name]
 	if !exists {
@@ -284,6 +291,16 @@ func (fs *FileSystem) write(path string, data []byte, appendMode bool) error {
 		dir.children[name] = n
 	} else if n.isDir {
 		return fmt.Errorf("is a directory")
+	} else if !permWritable(n.perm) {
+		// 已存在文件：owner 无写位则拒绝覆盖，防止篡改只读系统文件污染环境
+		return fmt.Errorf("permission denied: file %q is read-only", path)
+	}
+	newSize := int64(len(data))
+	if appendMode {
+		newSize += int64(len(n.content))
+	}
+	if newSize > maxFileSize {
+		return fmt.Errorf("file %q exceeds max size %d", path, maxFileSize)
 	}
 	if appendMode {
 		n.content = append(n.content, data...)
@@ -293,6 +310,15 @@ func (fs *FileSystem) write(path string, data []byte, appendMode bool) error {
 	n.size = int64(len(n.content))
 	n.mtime = time.Now()
 	return nil
+}
+
+// permWritable 判断权限串（如 "-rw-r--r--" / "drwxrwxrwt"）是否带写位。
+// 索引 2/5/8 分别为 owner/group/other 的写权限。
+func permWritable(perm string) bool {
+	if len(perm) < 9 {
+		return true // 非法/未知权限串按可写处理，避免误拒绝
+	}
+	return perm[2] == 'w' || perm[5] == 'w' || perm[8] == 'w'
 }
 
 // Glob 通配符匹配（支持末层 * ? []），返回绝对路径列表，供 shell 字段展开

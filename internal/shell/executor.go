@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"honeypot-go/internal/event"
@@ -20,10 +19,17 @@ type Executor struct {
 	hostname string
 	logger   *slog.Logger
 	vnet     *vnet.VNet
-
-	mu           sync.Mutex
-	curSessionID string // 供 vnet 事件关联（尽力而为，多会话低频）
 }
+
+// execCtx 单次 Execute 的执行上下文：承载会话 ID 与命令替换/子 shell 嵌套深度。
+// 每次 Execute 独立创建，仅在同一 goroutine 内同步使用，无跨会话共享。
+type execCtx struct {
+	sessionID string
+	depth     int
+}
+
+// maxCmdSubstDepth 命令替换/子 shell 最大嵌套深度：防深嵌套展开耗尽栈与 CPU。
+const maxCmdSubstDepth = 32
 
 // Result 一次命令执行的结果
 type Result struct {
@@ -36,12 +42,27 @@ func New(fs *vfs.FileSystem, bus *event.Bus, hostname string, logger *slog.Logge
 	return &Executor{fs: fs, bus: bus, hostname: hostname, logger: logger, vnet: vnet.New(bus, logger)}
 }
 
+// maxOutputSize 单命令合并输出上限：防 cat 大文件 / 命令叠加把输出缓冲、channel 写入与 ttyrec 录制撑爆
+const maxOutputSize = 8 << 20 // 8 MiB
+
+// truncSuffix 输出截断时追加的提示
+var truncSuffix = []byte("\n...(output truncated)\n")
+
+// limitOutput 将输出截断到 maxOutputSize，超出部分丢弃并在末尾追加提示
+func limitOutput(out []byte) []byte {
+	if len(out) <= maxOutputSize {
+		return out
+	}
+	truncated := make([]byte, maxOutputSize+len(truncSuffix))
+	copy(truncated, out[:maxOutputSize])
+	copy(truncated[maxOutputSize:], truncSuffix)
+	return truncated
+}
+
 // Execute 执行一段命令串（可含 ; && || | $()），返回最终 exit code 与合并输出。
 // 返回执行后的新 cwd（支持 cd 状态变更）。
 func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
-	e.mu.Lock()
-	e.curSessionID = sessionID
-	e.mu.Unlock()
+	ctx := &execCtx{sessionID: sessionID}
 
 	start := time.Now()
 	var (
@@ -50,11 +71,12 @@ func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
 		output []byte
 		ok     bool
 	)
-	newCwd, code, output, ok = e.runAST(cwd, raw)
+	newCwd, code, output, ok = e.runAST(ctx, cwd, raw)
 	if !ok {
 		// AST 解析失败（非常规语法），fallback 到旧的轻量解析
-		newCwd, code, output = e.runSequence(cwd, raw)
+		newCwd, code, output = e.runSequence(ctx, cwd, raw)
 	}
+	output = limitOutput(output)
 	res := Result{Output: output, Code: code}
 
 	e.bus.Publish(event.New(event.TypeCommandExecuted, map[string]any{
@@ -69,7 +91,7 @@ func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
 }
 
 // runSequence 按 ; 和 && / || 拆分执行序列，返回新 cwd
-func (e *Executor) runSequence(cwd, raw string) (string, int, []byte) {
+func (e *Executor) runSequence(ctx *execCtx, cwd, raw string) (string, int, []byte) {
 	var out []byte
 	code := 0
 	for _, seg := range splitTopLevel(raw, ';') {
@@ -77,12 +99,12 @@ func (e *Executor) runSequence(cwd, raw string) (string, int, []byte) {
 		if seg == "" {
 			continue
 		}
-		cwd, code, out = e.runAndOr(cwd, seg, out)
+		cwd, code, out = e.runAndOr(ctx, cwd, seg, out)
 	}
 	return cwd, code, out
 }
 
-func (e *Executor) runAndOr(cwd, seg string, out []byte) (string, int, []byte) {
+func (e *Executor) runAndOr(ctx *execCtx, cwd, seg string, out []byte) (string, int, []byte) {
 	tokens := splitLogical(seg)
 	if len(tokens) == 0 {
 		return cwd, 0, out
@@ -94,7 +116,7 @@ func (e *Executor) runAndOr(cwd, seg string, out []byte) (string, int, []byte) {
 			continue
 		}
 		var c int
-		cwd, c, out = e.execPipeline(cwd, cmd, out)
+		cwd, c, out = e.execPipeline(ctx, cwd, cmd, out)
 		if t.op == "&&" && c != 0 {
 			return cwd, c, out
 		}
@@ -106,14 +128,14 @@ func (e *Executor) runAndOr(cwd, seg string, out []byte) (string, int, []byte) {
 	return cwd, code, out
 }
 
-func (e *Executor) execPipeline(cwd, cmd string, out []byte) (string, int, []byte) {
+func (e *Executor) execPipeline(ctx *execCtx, cwd, cmd string, out []byte) (string, int, []byte) {
 	cmds := splitTopLevel(cmd, '|')
 	if len(cmds) == 1 {
 		args := tokenize(strings.TrimSpace(cmds[0]))
 		if len(args) == 0 {
 			return cwd, 0, out
 		}
-		return e.execOne(cwd, args, out)
+		return e.execOne(ctx, cwd, args, out)
 	}
 	// 管道：M1 简化——按顺序执行，合并输出
 	code := 0
@@ -122,13 +144,13 @@ func (e *Executor) execPipeline(cwd, cmd string, out []byte) (string, int, []byt
 		if len(args) == 0 {
 			continue
 		}
-		cwd, code, out = e.execOne(cwd, args, out)
+		cwd, code, out = e.execOne(ctx, cwd, args, out)
 	}
 	return cwd, code, out
 }
 
 // execOne 执行单条命令，返回新 cwd
-func (e *Executor) execOne(cwd string, args []string, out []byte) (string, int, []byte) {
+func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) (string, int, []byte) {
 	bin := args[0]
 	// 支持 /bin/ls 这类带路径形式
 	if i := strings.LastIndex(bin, "/"); i >= 0 {
@@ -138,7 +160,7 @@ func (e *Executor) execOne(cwd string, args []string, out []byte) (string, int, 
 
 	// M2: 虚拟网络命令（ping/curl/wget/nc 等），仿真出站、记录目标
 	normArgs := append([]string{bin}, rest...)
-	if ob, code, handled := e.vnet.Exec(e.sessionID(), normArgs); handled {
+	if ob, code, handled := e.vnet.Exec(ctx.sessionID, normArgs); handled {
 		return cwd, code, append(out, ob...)
 	}
 
@@ -309,13 +331,6 @@ root         410     403  0 00:00 pts/0    00:00:00 ps -ef
   402 pts/0    00:00:00 bash
   410 pts/0    00:00:00 ps
 `)
-}
-
-// sessionID 返回当前会话 ID（供 vnet 事件关联）
-func (e *Executor) sessionID() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.curSessionID
 }
 
 // preview 截取输出前 200 字节作为摘要

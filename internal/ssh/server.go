@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -47,6 +48,16 @@ func nl2crlf(b []byte) []byte {
 	return out
 }
 
+// 防御常量
+const (
+	// handshakeTimeout 握手超时：攻击者只连不上/握手发一半会永久占住 sem 槽位（slowloris）
+	handshakeTimeout = 30 * time.Second
+	// maxChannelsPerConn 单连接最多并发 session channel 数
+	maxChannelsPerConn = 8
+	// maxInteractiveLine 交互 shell 单行输入上限，防超长粘贴撑爆内存
+	maxInteractiveLine = 64 << 10 // 64 KiB
+)
+
 // Server 蜜罐 SSH 服务端
 type Server struct {
 	cfg        *config.Config
@@ -59,8 +70,51 @@ type Server struct {
 	exec *shell.Executor
 	fs   *vfs.FileSystem
 
+	// authLimit IP 级认证限速：防单源高频建连爆破刷资源
+	authLimit *authLimiter
+
 	mu        sync.Mutex
 	listeners []net.Listener
+}
+
+// authLimiter IP 级认证限速：滑动窗口内认证尝试超限即拒绝。
+// 蜜罐仍收集全部低频爆破凭据，仅挡住单源高频刷资源（默认 60 次/分钟/IP）。
+type authLimiter struct {
+	mu   sync.Mutex
+	seen map[string][]time.Time // ip -> 窗口内认证尝试时间戳
+}
+
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{seen: make(map[string][]time.Time)}
+}
+
+func (l *authLimiter) allow(ip string) bool {
+	const (
+		window     = time.Minute
+		maxPerIP   = 60
+		maxEntries = 65536
+	)
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// 防 map 被海量不同 IP 撑爆：条目超限时整体重置（短暂放开限速，可接受）
+	if len(l.seen) >= maxEntries {
+		l.seen = make(map[string][]time.Time)
+	}
+	cut := now.Add(-window)
+	ts := l.seen[ip]
+	kept := ts[:0]
+	for _, t := range ts {
+		if t.After(cut) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= maxPerIP {
+		l.seen[ip] = kept
+		return false
+	}
+	l.seen[ip] = append(kept, now)
+	return true
 }
 
 // New 创建服务端：加载/生成主机密钥，准备共享执行器
@@ -79,6 +133,7 @@ func New(cfg *config.Config, bus *event.Bus, authn *auth.Authenticator, logger *
 		sem:        make(chan struct{}, cfg.Server.MaxConnections),
 		exec:       shell.New(fs, bus, cfg.VFS.Hostname, logger),
 		fs:         fs,
+		authLimit:  newAuthLimiter(),
 	}, nil
 }
 
@@ -148,6 +203,15 @@ func (s *Server) listenOne(ctx context.Context, addr string) error {
 		}
 		go func() {
 			defer func() { <-s.sem }()
+			// 防御：executor/sftp 处理链中任何 panic（含攻击者可控触发的越界）
+			// 若放任向上传播会终止整个蜜罐进程（进程级 DoS + 检测断档）。
+			// 连接级兜底：recover 后仅断开该连接，其余连接不受影响。
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("panic in connection handler",
+						"remote", nc.RemoteAddr().String(), "panic", r)
+				}
+			}()
 			s.handleConn(nc)
 		}()
 	}
@@ -171,10 +235,15 @@ func (s *Server) handleConn(nc net.Conn) {
 		"client_version": "",
 	}))
 
+	ip := remote.IP.String()
 	serverConfig := &ssh.ServerConfig{
 		ServerVersion: s.cfg.SSH.ServerVersion,
 		MaxAuthTries:  6,
 		PasswordCallback: func(cm ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			// IP 级认证限速：防单源高频建连爆破刷资源
+			if !s.authLimit.allow(ip) {
+				return nil, fmt.Errorf("authentication rate limited")
+			}
 			if s.auth.Check(connID, cm.User(), string(pass), "password") {
 				return &ssh.Permissions{}, nil
 			}
@@ -183,6 +252,9 @@ func (s *Server) handleConn(nc net.Conn) {
 	}
 	if s.cfg.Auth.KeyboardInteractive {
 		serverConfig.KeyboardInteractiveCallback = func(cm ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			if !s.authLimit.allow(ip) {
+				return nil, fmt.Errorf("authentication rate limited")
+			}
 			if s.auth.CheckKeyboardInteractive(connID, cm.User(), challenge) {
 				return &ssh.Permissions{}, nil
 			}
@@ -200,12 +272,16 @@ func (s *Server) handleConn(nc net.Conn) {
 	}
 	serverConfig.AddHostKey(s.hostSigner)
 
+	// 握手超时防御：NewServerConn 本身不设 deadline，攻击者可握手发一半就挂起，
+	// 永久占满 sem 槽位拒绝正常访问。设置 deadline 后超时自动断开。
+	_ = nc.SetDeadline(time.Now().Add(handshakeTimeout))
 	conn, chans, reqs, err := ssh.NewServerConn(nc, serverConfig)
 	if err != nil {
 		s.logger.Debug("handshake/authentication failed", "connection_id", connID, "remote", nc.RemoteAddr().String(), "error", err)
 		s.closeConn(connID, "")
 		return
 	}
+	_ = nc.SetDeadline(time.Time{}) // 清除握手 deadline，避免影响后续 channel 读写
 
 	clientVersion := conn.ClientVersion()
 	s.logger.Info("session authenticated",
@@ -217,19 +293,77 @@ func (s *Server) handleConn(nc net.Conn) {
 
 	go ssh.DiscardRequests(reqs)
 
+	// 连接级空闲兜底：交互 shell 自带 IdleTimeout，但 SFTP/exec/等待新 channel
+	// 等非交互路径没有超时，攻击者认证后挂起可长期占住并发槽位。这里对整条连接
+	// 做粗粒度 idle 看门狗：超过 IdleTimeout 无 channel 活动即强制断开。
+	idleTimeout := s.cfg.Server.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 5 * time.Minute
+	}
+	var actMu sync.Mutex
+	lastAct := time.Now()
+	refresh := func() {
+		actMu.Lock()
+		lastAct = time.Now()
+		actMu.Unlock()
+	}
+	stopWatch := make(chan struct{})
+	go func() {
+		t := time.NewTicker(idleTimeout)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-t.C:
+				actMu.Lock()
+				elapsed := time.Since(lastAct)
+				actMu.Unlock()
+				if elapsed >= idleTimeout {
+					s.logger.Debug("connection idle timeout, closing", "connection_id", connID)
+					_ = nc.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	// 单连接 channel 数上限：每个 channel 会占一个 goroutine + ttyrec 文件句柄，
+	// 防止一个已认证连接开海量 session channel 耗尽资源。
+	chanSem := make(chan struct{}, maxChannelsPerConn)
 	for newCh := range chans {
+		refresh()
 		if newCh.ChannelType() != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
 			continue
 		}
+		select {
+		case chanSem <- struct{}{}:
+		default:
+			_ = newCh.Reject(ssh.ResourceShortage, "too many concurrent channels")
+			continue
+		}
 		ch, requests, err := newCh.Accept()
 		if err != nil {
+			<-chanSem
 			s.logger.Debug("accept channel failed", "error", err)
 			continue
 		}
-		go s.handleSession(conn, connID, ch, requests)
+		go func() {
+			defer func() { <-chanSem }()
+			// handleSession 运行在独立 goroutine（handleConn 的 recover 覆盖不到），
+			// 此处单独兜底：exec/shell/sftp 子系统的 panic 只杀该 channel 不杀进程
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("panic in session handler",
+						"connection_id", connID, "panic", r)
+				}
+			}()
+			s.handleSession(conn, connID, ch, requests, refresh)
+		}()
 	}
 
+	close(stopWatch)
 	_ = conn.Wait()
 	s.closeConn(connID, string(clientVersion))
 }
@@ -242,7 +376,7 @@ func (s *Server) closeConn(connID, clientVersion string) {
 }
 
 // handleSession 处理 session channel 上的请求（pty-req / exec / shell / subsystem...）
-func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Channel, reqs <-chan *ssh.Request) {
+func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Channel, reqs <-chan *ssh.Request, refresh func()) {
 	defer ch.Close()
 
 	var (
@@ -255,10 +389,10 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 			return
 		}
 		sess = session.New(connID, chType, s.fs, s.exec, s.bus, s.logger)
-		// ttyrec 录制
+		// ttyrec 录制：含全部命令内容，目录/文件权限收紧
 		dir := filepath.Join(s.cfg.Storage.DataDir, "recordings")
-		if err := os.MkdirAll(dir, 0o755); err == nil {
-			if f, err := os.Create(filepath.Join(dir, sess.ID+".ttyrec")); err == nil {
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			if f, err := os.OpenFile(filepath.Join(dir, sess.ID+".ttyrec"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
 				recFile = f
 				sess.SetRecorder(tty.NewRecorder(f))
 			}
@@ -278,6 +412,7 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 	}
 
 	for req := range reqs {
+		refresh() // 任何请求都视为连接活动，刷新连接级 idle
 		switch req.Type {
 		case "pty-req":
 			var p struct {
@@ -326,7 +461,7 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 		case "shell":
 			_ = req.Reply(true, nil)
 			createSession("shell")
-			s.runInteractiveShell(ch, sess)
+			s.runInteractiveShell(ch, sess, refresh)
 			closeSession()
 			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
 			return
@@ -360,23 +495,59 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 	closeSession()
 }
 
-// runInteractiveShell 交互式 shell 循环：回显按键、逐行执行命令
-func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
+// runInteractiveShell 交互式 shell 循环：回显按键、逐行执行命令。
+// 通过 select + 定时器实现真正的 IdleTimeout：认证后不发数据的连接（slowloris）
+// 到期自动断开，不再永久占住并发槽位。
+func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refresh func()) {
+	timeout := s.cfg.Server.IdleTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+
 	prompt := sess.Prompt()
 	promptOut := nl2crlf([]byte(prompt))
 	_, _ = ch.Write(promptOut)
 	sess.RecordOutput(promptOut)
 
-	line := make([]byte, 0, 256)
-	buf := make([]byte, 4096)
-	for {
-		n, err := ch.Read(buf)
-		if err != nil {
-			return
+	// 读 goroutine：ch.Read 阻塞，读结果经 dataCh 交给主循环（配合 idle 定时器）。
+	// done 通道保证函数退出后读 goroutine 不再阻塞在 dataCh 发送上。
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	done := make(chan struct{})
+	defer close(done)
+	dataCh := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ch.Read(buf)
+			if n > 0 {
+				cp := make([]byte, n)
+				copy(cp, buf[:n])
+				select {
+				case dataCh <- readResult{data: cp}:
+				case <-done:
+					return
+				}
+			}
+			if err != nil {
+				select {
+				case dataCh <- readResult{err: err}:
+				default:
+				}
+				return
+			}
 		}
-		data := buf[:n]
-		sess.RecordInput(data)
+	}()
 
+	idle := time.NewTimer(timeout)
+	defer idle.Stop()
+
+	line := make([]byte, 0, 256)
+	process := func(data []byte) bool {
+		refresh() // 有输入活动，刷新连接级 idle
+		sess.RecordInput(data)
 		for _, b := range data {
 			switch b {
 			case '\r', '\n':
@@ -385,7 +556,7 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
 				cmd := string(line)
 				line = line[:0]
 				if cmd == "exit" || cmd == "logout" {
-					return
+					return false
 				}
 				out := sess.ExecuteLine(cmd)
 				if len(out) > 0 {
@@ -406,7 +577,7 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
 
 			case 0x04: // Ctrl-D
 				_, _ = ch.Write([]byte("logout\r\n"))
-				return
+				return false
 
 			case 0x7f, 0x08: // Backspace
 				if len(line) > 0 {
@@ -417,11 +588,38 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
 
 			default:
 				if b >= 0x20 || b == '\t' {
-					line = append(line, b)
-					_, _ = ch.Write([]byte{b})
-					sess.RecordOutput([]byte{b})
+					// 超长行截断，防止无回车粘贴无限增长占用内存
+					if len(line) < maxInteractiveLine {
+						line = append(line, b)
+						_, _ = ch.Write([]byte{b})
+						sess.RecordOutput([]byte{b})
+					}
 				}
 			}
+		}
+		return true
+	}
+
+	for {
+		select {
+		case r := <-dataCh:
+			if r.err != nil {
+				return
+			}
+			if !process(r.data) {
+				return
+			}
+			// 有输入活动，重置空闲计时器
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(timeout)
+		case <-idle.C:
+			s.logger.Debug("interactive shell idle timeout, closing", "session_id", sess.ID)
+			return
 		}
 	}
 }

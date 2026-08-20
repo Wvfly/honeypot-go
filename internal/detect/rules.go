@@ -44,10 +44,17 @@ var rules = []Rule{
 				return false
 			}
 			cmd := strings.ToLower(eventStr(ev, "command"))
-			for _, w := range []string{"whoami", "uname", "id ", "hostname", "ifconfig"} {
+			for _, w := range []string{"whoami", "uname", "hostname", "ifconfig"} {
 				if strings.Contains(cmd, w) {
 					return true
 				}
+			}
+			// id 命令按命令边界匹配（避免 pid/uid 等误报），"id" 单独执行也能命中
+			if strings.HasPrefix(cmd, "id") || strings.Contains(cmd, " id") ||
+				strings.Contains(cmd, ";id") || strings.Contains(cmd, "&&id") ||
+				strings.Contains(cmd, "||id") || strings.Contains(cmd, "&id") ||
+				strings.Contains(cmd, "|id") {
+				return true
 			}
 			return false
 		},
@@ -79,11 +86,23 @@ var rules = []Rule{
 				return false
 			}
 			low := strings.ToLower(eventStr(ev, "command"))
+			// ncat/netcat 不包含子串 "nc "，需单独覆盖
+			ncLike := strings.Contains(low, "nc ") || strings.Contains(low, "ncat") ||
+				strings.Contains(low, "netcat")
 			return strings.Contains(low, "mkfifo") ||
-				(strings.Contains(low, "nc ") && strings.Contains(low, "-l")) ||
+				(ncLike && strings.Contains(low, "-l")) ||
+				// nc -e / ncat -e / netcat -e：执行命令模式（正连与反连均构成反弹 shell 尝试）。
+				// 子串 "-e" 同时覆盖内联形式 -e/bin/sh，且 "-e" 在 nc 命令语境下误报面极小
+				(ncLike && strings.Contains(low, "-e")) ||
 				strings.Contains(low, "bash -i") ||
 				strings.Contains(low, "sh -i") ||
-				strings.Contains(low, "socat")
+				strings.Contains(low, "socat") ||
+				strings.Contains(low, "/dev/tcp/") ||
+				strings.Contains(low, "/dev/udp/") ||
+				(strings.Contains(low, "python") && strings.Contains(low, "socket")) ||
+				(strings.Contains(low, "perl") && strings.Contains(low, "socket")) ||
+				strings.Contains(low, "powershell -nop") ||
+				strings.Contains(low, "-enc ")
 		},
 	},
 	{
@@ -106,8 +125,19 @@ var rules = []Rule{
 			if ev.Type != event.TypeCommandExecuted {
 				return false
 			}
-			cmd := eventStr(ev, "command")
-			return strings.Contains(cmd, "/etc/shadow") || strings.Contains(cmd, "/etc/passwd")
+			// 匹配通配符变体（cat /etc/sha*dow、/etc/pass* 等）：展开前原始命令
+			// 不含完整路径，故用前缀子串兜底
+			low := strings.ToLower(eventStr(ev, "command"))
+			for _, s := range []string{
+				"/etc/shadow", "/etc/sha", "/etc/passwd", "/etc/pass",
+				"/etc/master.passwd", "/etc/group", "/etc/sudoers", "/etc/hosts",
+				"getent passwd", "getent shadow",
+			} {
+				if strings.Contains(low, s) {
+					return true
+				}
+			}
+			return false
 		},
 	},
 	{

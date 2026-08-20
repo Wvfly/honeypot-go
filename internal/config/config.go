@@ -56,6 +56,9 @@ type VFSConfig struct {
 type StorageConfig struct {
 	DataDir string `yaml:"data_dir"`
 	Driver  string `yaml:"driver"` // 逗号分隔: sqlite,jsonl
+	// RetentionDays 数据保留天数：超过后清理 SQLite 旧记录与过期 JSONL 流水。
+	// 0 表示不清理（注意：长期运行可能耗尽磁盘）。
+	RetentionDays int `yaml:"retention_days"`
 }
 
 type LogConfig struct {
@@ -86,8 +89,9 @@ func Default() *Config {
 			Users:    []string{"root", "ubuntu"},
 		},
 		Storage: StorageConfig{
-			DataDir: "data",
-			Driver:  "sqlite,jsonl",
+			DataDir:       "data",
+			Driver:        "sqlite,jsonl",
+			RetentionDays: 30,
 		},
 		Detect: DetectConfig{
 			Enabled:    true,
@@ -139,6 +143,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.DataDir == "" {
 		c.Storage.DataDir = "data"
+	}
+	if c.Storage.RetentionDays < 0 {
+		c.Storage.RetentionDays = 0 // 0 = 不清理
 	}
 	return nil
 }

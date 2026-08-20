@@ -20,7 +20,7 @@ import (
 //       管道(|)、逻辑操作符(&&/||)、分号(;)、重定向(>、>>)、后台(&)、否定(!)。
 
 // runAST 解析并执行整段命令串（优先路径），失败时返回 false 由调用方 fallback。
-func (e *Executor) runAST(cwd, raw string) (string, int, []byte, bool) {
+func (e *Executor) runAST(ctx *execCtx, cwd, raw string) (string, int, []byte, bool) {
 	f, err := syntax.NewParser().Parse(strings.NewReader(raw), "")
 	if err != nil {
 		return cwd, 0, nil, false
@@ -29,19 +29,19 @@ func (e *Executor) runAST(cwd, raw string) (string, int, []byte, bool) {
 	code := 0
 	for _, stmt := range f.Stmts {
 		var c int
-		cwd, c, out = e.runStmt(cwd, stmt, out)
+		cwd, c, out = e.runStmt(ctx, cwd, stmt, out)
 		code = c
 	}
 	return cwd, code, out, true
 }
 
 // runStmt 执行一条语句（处理 !、后台、子 shell、&&/||/|）
-func (e *Executor) runStmt(cwd string, stmt *syntax.Stmt, out []byte) (string, int, []byte) {
+func (e *Executor) runStmt(ctx *execCtx, cwd string, stmt *syntax.Stmt, out []byte) (string, int, []byte) {
 	if stmt.Background {
 		// 后台执行 &：简化——同步执行，输出照常合并
 		s := *stmt
 		s.Background = false
-		return e.runStmt(cwd, &s, out)
+		return e.runStmt(ctx, cwd, &s, out)
 	}
 	var code int
 	switch cmd := stmt.Cmd.(type) {
@@ -49,14 +49,14 @@ func (e *Executor) runStmt(cwd string, stmt *syntax.Stmt, out []byte) (string, i
 		switch cmd.Op {
 		case syntax.Pipe:
 			// 管道链：展开为语句序列后按过滤语义执行
-			cwd, code, out = e.runPipeChain(cwd, pipeCmds(stmt), out)
+			cwd, code, out = e.runPipeChain(ctx, cwd, pipeCmds(stmt), out)
 		default: // && / ||
 			var xc int
-			cwd, xc, out = e.runStmt(cwd, cmd.X, out)
+			cwd, xc, out = e.runStmt(ctx, cwd, cmd.X, out)
 			runY := (cmd.Op == syntax.AndStmt && xc == 0) || (cmd.Op == syntax.OrStmt && xc != 0)
 			if runY {
 				var yc int
-				cwd, yc, out = e.runStmt(cwd, cmd.Y, out)
+				cwd, yc, out = e.runStmt(ctx, cwd, cmd.Y, out)
 				if cmd.Op == syntax.OrStmt && yc == 0 {
 					xc = 0
 				} else {
@@ -67,13 +67,18 @@ func (e *Executor) runStmt(cwd string, stmt *syntax.Stmt, out []byte) (string, i
 		}
 
 	case *syntax.CallExpr:
-		cwd, code, out = e.runCall(cwd, cmd, stmt.Redirs, out)
+		cwd, code, out = e.runCall(ctx, cwd, cmd, stmt.Redirs, out)
 
 	case *syntax.Subshell:
-		// 子 shell (...) 或 $() 内联：同步执行合并输出
-		for _, s := range cmd.Stmts {
-			cwd, code, out = e.runStmt(cwd, s, out)
+		// 子 shell (...) 或 $() 内联：同步执行合并输出（限制嵌套深度）
+		if ctx.depth >= maxCmdSubstDepth {
+			return cwd, 1, out
 		}
+		ctx.depth++
+		for _, s := range cmd.Stmts {
+			cwd, code, out = e.runStmt(ctx, cwd, s, out)
+		}
+		ctx.depth--
 
 	default:
 		// 其他语句类型（if/for/赋值等）：简单忽略
@@ -94,7 +99,7 @@ func pipeCmds(stmt *syntax.Stmt) []*syntax.Stmt {
 }
 
 // runPipeChain 执行管道链：非过滤命令输出作为下游过滤命令输入
-func (e *Executor) runPipeChain(cwd string, stmts []*syntax.Stmt, out []byte) (string, int, []byte) {
+func (e *Executor) runPipeChain(ctx *execCtx, cwd string, stmts []*syntax.Stmt, out []byte) (string, int, []byte) {
 	var (
 		code int
 		buf  []byte
@@ -104,7 +109,7 @@ func (e *Executor) runPipeChain(cwd string, stmts []*syntax.Stmt, out []byte) (s
 		if !ok {
 			continue
 		}
-		args, err := e.expandArgs(cwd, call)
+		args, err := e.expandArgs(ctx, cwd, call)
 		if err != nil || len(args) == 0 {
 			continue
 		}
@@ -115,25 +120,25 @@ func (e *Executor) runPipeChain(cwd string, stmts []*syntax.Stmt, out []byte) (s
 			continue
 		}
 		// 首段或非过滤段：正常执行
-		cwd, code, buf = e.runCall(cwd, call, s.Redirs, buf)
+		cwd, code, buf = e.runCall(ctx, cwd, call, s.Redirs, buf)
 	}
 	out = append(out, buf...)
 	return cwd, code, out
 }
 
 // runCall 展开参数并执行单条命令；处理重定向(>/>>)
-func (e *Executor) runCall(cwd string, call *syntax.CallExpr, redirs []*syntax.Redirect, out []byte) (string, int, []byte) {
-	args, err := e.expandArgs(cwd, call)
+func (e *Executor) runCall(ctx *execCtx, cwd string, call *syntax.CallExpr, redirs []*syntax.Redirect, out []byte) (string, int, []byte) {
+	args, err := e.expandArgs(ctx, cwd, call)
 	if err != nil || len(args) == 0 {
 		return cwd, 0, out
 	}
 	var code int
 	prefix := len(out)
-	cwd, code, out = e.execOne(cwd, args, out)
+	cwd, code, out = e.execOne(ctx, cwd, args, out)
 
 	// 重定向：把本次输出写入文件，终端不再显示
 	for _, r := range redirs {
-		target, terr := e.expandWord(cwd, r.Word)
+		target, terr := e.expandWord(ctx, cwd, r.Word)
 		if terr != nil || target == "" {
 			continue
 		}
@@ -149,18 +154,18 @@ func (e *Executor) runCall(cwd string, call *syntax.CallExpr, redirs []*syntax.R
 		default: // > 及其他输出重定向
 			_ = e.fs.WriteFile(path, added)
 		}
-		e.publishFileWritten(path, added)
+		e.publishFileWritten(ctx, path, added)
 	}
 	return cwd, code, out
 }
 
 // expandArgs 字段展开一条命令的全部参数（引号/变量/通配符/命令替换）
-func (e *Executor) expandArgs(cwd string, call *syntax.CallExpr) ([]string, error) {
-	return expand.Fields(e.expandConfig(cwd), call.Args...)
+func (e *Executor) expandArgs(ctx *execCtx, cwd string, call *syntax.CallExpr) ([]string, error) {
+	return expand.Fields(e.expandConfig(ctx, cwd), call.Args...)
 }
 
 // expandConfig 构造展开配置：环境变量、命令替换 $()/“、通配符（走 VFS）
-func (e *Executor) expandConfig(cwd string) *expand.Config {
+func (e *Executor) expandConfig(ctx *execCtx, cwd string) *expand.Config {
 	return &expand.Config{
 		Env: expand.FuncEnviron(func(name string) string {
 			switch name {
@@ -176,11 +181,22 @@ func (e *Executor) expandConfig(cwd string) *expand.Config {
 			return "" // 空串视为未设置
 		}),
 		CmdSubst: func(w io.Writer, cs *syntax.CmdSubst) error {
+			// 防深嵌套命令替换耗尽栈/CPU
+			if ctx.depth >= maxCmdSubstDepth {
+				return fmt.Errorf("command substitution nesting too deep")
+			}
+			ctx.depth++
+			defer func() { ctx.depth-- }()
 			var out []byte
 			for _, s := range cs.Stmts {
 				var c int
-				_, c, out = e.runStmt(cwd, s, out)
+				_, c, out = e.runStmt(ctx, cwd, s, out)
 				_ = c
+				// 命令替换输出同样受限，防止内存放大
+				if len(out) >= maxOutputSize {
+					out = out[:maxOutputSize]
+					break
+				}
 			}
 			_, err := w.Write(out)
 			return err
@@ -192,11 +208,11 @@ func (e *Executor) expandConfig(cwd string) *expand.Config {
 }
 
 // expandWord 展开单个 word 为重定向目标
-func (e *Executor) expandWord(cwd string, w *syntax.Word) (string, error) {
+func (e *Executor) expandWord(ctx *execCtx, cwd string, w *syntax.Word) (string, error) {
 	if w == nil {
 		return "", nil
 	}
-	parts, err := expand.Fields(e.expandConfig(cwd), w)
+	parts, err := expand.Fields(e.expandConfig(ctx, cwd), w)
 	if err != nil {
 		return "", err
 	}
@@ -206,9 +222,9 @@ func (e *Executor) expandWord(cwd string, w *syntax.Word) (string, error) {
 	return parts[0], nil
 }
 
-func (e *Executor) publishFileWritten(path string, data []byte) {
+func (e *Executor) publishFileWritten(ctx *execCtx, path string, data []byte) {
 	e.bus.Publish(event.New(event.TypeFileWritten, map[string]any{
-		"session_id": e.sessionID(),
+		"session_id": ctx.sessionID,
 		"path":       path,
 		"size":       len(data),
 		"sha256":     sha256sum(data),
