@@ -1,7 +1,7 @@
 # honeypot-go
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)
-![Status](https://img.shields.io/badge/Status-M1%20MVP-orange)
+![Status](https://img.shields.io/badge/Status-M2%20Release-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-4EAA25)
 ![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
 [中文文档](README.md) | [English](README.en.md)
@@ -26,12 +26,17 @@
 - ttyrec 会话录制：攻击者的每次按键与终端输出可逐帧回放
 - 优雅退出：停机前 drain 事件，保证数据零丢失
 
-**规划中（M2/M3）**
+**已实现（M2）**
 
-- `keyboard-interactive` / 公钥认证伪造
-- `mvdan.cc/sh` 完整 shell 语法解析
-- 虚拟网络仿真（`wget/curl/ping` 下载诱饵、投毒载荷捕获）
-- SFTP 子系统仿真、规则引擎 + 风险评分 + Webhook/Syslog 告警
+- 认证方法扩展：`keyboard-interactive`（问答式模拟）、`publickey`（记录后必拒）、`NoClientAuth` 探测性登录
+- 完整 Shell 语法解析（`mvdan.cc/sh` AST）：`$()` 命令替换、`&& / || / ;` 组合、管道、通配符展开、重定向、后台任务
+- 虚拟网络仿真（`internal/vnet`）：`ping / curl / wget / nc` 不真实发包，记录目标 IP / 端口 / URL
+- SFTP 子系统仿真：列目录 / 下载 / 上传全部走虚拟 FS，上传内容捕获为 `file.written` 事件
+- 规则引擎 + 风险评分（`internal/detect`）：爆破、侦察、下载投递、反弹 Shell、持久化、横向移动 6 类规则，连接级累计评分 + 严重级别告警
+- 告警推送：`alert` 事件入库 + 可选 Webhook（飞书/钉钉/Slack 机器人）
+
+**规划中（M3）**
+
 - YARA 载荷检测、SIEM/CEF 对接、攻击链可视化
 
 ---
@@ -108,6 +113,9 @@ ssh:
 auth:
   success_probability: 0.02   # 弱口令命中后的放行概率（0~1），生产 0.01~0.05，测试 1.0
   delay_ms: [200, 800]        # 认证模拟延迟（毫秒），模拟真实密码校验
+  keyboard_interactive: true  # keyboard-interactive 认证开关（默认开）
+  publickey: true             # 公钥认证开关（默认开，记录后必拒）
+  allow_no_auth: false        # 允许探测性登录（制造高价值会话，默认关）
   weak_passwords: [root, admin, password, 123456, ...]   # 弱口令库
 
 vfs:
@@ -117,6 +125,10 @@ vfs:
 storage:
   data_dir: "data"            # 数据目录（建议部署时改绝对路径）
   driver: "sqlite,jsonl"      # sqlite 结构化 + jsonl 原始流水，可同时启用
+
+detect:
+  enabled: true               # 规则引擎 + 风险评分 + 告警
+  webhook_url: ""             # 可选：告警 JSON POST 推送到 webhook（如飞书/钉钉）
 
 log:
   level: "info"               # debug / info / warn / error
@@ -130,7 +142,7 @@ log:
 
 ```
 data/
-├── honeypot.db          # SQLite 结构化主存储（4 张表）
+├── honeypot.db          # SQLite 结构化主存储（5 张表）
 ├── events/YYYY-MM-DD.jsonl     # JSONL 原始事件流水（按天分片）
 ├── recordings/<sess_id>.ttyrec # ttyrec 会话录制
 └── host_key             # SSH 主机密钥（机密，勿提交）
@@ -138,11 +150,11 @@ data/
 
 | 工具 | 用途 | 用法 |
 |---|---|---|
-| `cmd/dbquery` | 打印全部 4 张表（连接/爆破/会话/命令） | `go run ./cmd/dbquery` |
+| `cmd/dbquery` | 打印全部 5 张表（连接/爆破/会话/命令/扩展事件） | `go run ./cmd/dbquery` |
 | `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本 | `go run ./cmd/ttyshow data\recordings\*.ttyrec` |
 | SQLite 关联查询 | 按 IP 关联攻击者全部行为 | `sqlite3 data\honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
-> `auth_attempts` 记录每次爆破的**密码原文**；`commands` 记录每条命令的 exit code / 耗时 / 输出摘要。
+> `auth_attempts` 记录每次爆破的**密码原文**；`commands` 记录每条命令的 exit code / 耗时 / 输出摘要；`events` 通用表承载扩展事件（下载/连接/文件写入/告警），payload 为 JSON。
 
 ---
 
@@ -192,7 +204,7 @@ WantedBy=multi-user.target
 ## 冒烟测试
 
 ```powershell
-# 端到端验证：启动蜜罐 → 弱口令登录 → 命令执行 → 数据落盘
+# 端到端验证：启动蜜罐 → 弱口令登录 → keyboard-interactive → shell 语法 → VNet → SFTP → 数据落盘
 powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1
 ```
 
@@ -213,11 +225,13 @@ honeypot-go/
 │   ├── config/          # YAML 配置加载与校验
 │   ├── event/           # 事件总线（发布/订阅解耦）
 │   ├── ident/           # 连接/会话 ID
-│   ├── ssh/             # x/crypto/ssh 二次封装
-│   ├── auth/            # 认证欺骗（弱口令+概率放行+延迟）
+│   ├── ssh/             # x/crypto/ssh 封装 + SFTP 子系统仿真（sftp.go）
+│   ├── auth/            # 认证欺骗（password/keyboard-interactive/publickey）
 │   ├── session/         # 会话生命周期
-│   ├── shell/           # 命令解析与仿真执行
+│   ├── shell/           # AST 语法解析（parse.go）+ 命令仿真执行（executor.go）
 │   ├── vfs/             # 内存虚拟文件系统
+│   ├── vnet/            # 虚拟网络仿真（wget/curl/ping/nc）
+│   ├── detect/          # 规则引擎 + 风险评分 + Webhook 告警
 │   ├── tty/             # ttyrec 录制
 │   └── store/           # SQLite + JSONL 持久化
 ├── configs/honeypot.yaml

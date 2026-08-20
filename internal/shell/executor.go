@@ -4,19 +4,25 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"honeypot-go/internal/event"
 	"honeypot-go/internal/vfs"
+	"honeypot-go/internal/vnet"
 )
 
 // Executor 命令执行器：解析命令串并仿真执行，输出与真实系统相似的结果。
-// M1 支持：内建命令 + 常用系统命令 + 基础管道/分号/逻辑运算符拆分。
+// M2 支持：完整 shell 语法（引号/通配符/命令替换/管道/重定向）+ 虚拟网络命令。
 type Executor struct {
 	fs       *vfs.FileSystem
 	bus      *event.Bus
 	hostname string
 	logger   *slog.Logger
+	vnet     *vnet.VNet
+
+	mu           sync.Mutex
+	curSessionID string // 供 vnet 事件关联（尽力而为，多会话低频）
 }
 
 // Result 一次命令执行的结果
@@ -27,14 +33,28 @@ type Result struct {
 
 // New 创建执行器
 func New(fs *vfs.FileSystem, bus *event.Bus, hostname string, logger *slog.Logger) *Executor {
-	return &Executor{fs: fs, bus: bus, hostname: hostname, logger: logger}
+	return &Executor{fs: fs, bus: bus, hostname: hostname, logger: logger, vnet: vnet.New(bus, logger)}
 }
 
-// Execute 执行一段命令串（可含 ; && || |），返回最终 exit code 与合并输出。
+// Execute 执行一段命令串（可含 ; && || | $()），返回最终 exit code 与合并输出。
 // 返回执行后的新 cwd（支持 cd 状态变更）。
 func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
+	e.mu.Lock()
+	e.curSessionID = sessionID
+	e.mu.Unlock()
+
 	start := time.Now()
-	newCwd, code, output := e.runSequence(cwd, raw)
+	var (
+		newCwd string
+		code   int
+		output []byte
+		ok     bool
+	)
+	newCwd, code, output, ok = e.runAST(cwd, raw)
+	if !ok {
+		// AST 解析失败（非常规语法），fallback 到旧的轻量解析
+		newCwd, code, output = e.runSequence(cwd, raw)
+	}
 	res := Result{Output: output, Code: code}
 
 	e.bus.Publish(event.New(event.TypeCommandExecuted, map[string]any{
@@ -116,6 +136,12 @@ func (e *Executor) execOne(cwd string, args []string, out []byte) (string, int, 
 	}
 	rest := args[1:]
 
+	// M2: 虚拟网络命令（ping/curl/wget/nc 等），仿真出站、记录目标
+	normArgs := append([]string{bin}, rest...)
+	if ob, code, handled := e.vnet.Exec(e.sessionID(), normArgs); handled {
+		return cwd, code, append(out, ob...)
+	}
+
 	switch bin {
 	case "cd":
 		if len(rest) == 0 {
@@ -177,6 +203,8 @@ func (e *Executor) execOne(cwd string, args []string, out []byte) (string, int, 
 		return cwd, 1, out
 	case "exit", "logout":
 		return cwd, 0, out
+	case "grep", "egrep", "fgrep", "head", "tail", "wc", "sort", "uniq":
+		return cwd, 0, append(out, e.filterCmd(cwd, bin, rest)...)
 	default:
 		out = append(out, []byte("bash: "+args[0]+": command not found\n")...)
 		return cwd, 127, out
@@ -281,6 +309,13 @@ root         410     403  0 00:00 pts/0    00:00:00 ps -ef
   402 pts/0    00:00:00 bash
   410 pts/0    00:00:00 ps
 `)
+}
+
+// sessionID 返回当前会话 ID（供 vnet 事件关联）
+func (e *Executor) sessionID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.curSessionID
 }
 
 // preview 截取输出前 200 字节作为摘要

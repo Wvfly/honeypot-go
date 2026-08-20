@@ -16,7 +16,14 @@ type Config struct {
 	Auth    AuthConfig    `yaml:"auth"`
 	VFS     VFSConfig     `yaml:"vfs"`
 	Storage StorageConfig `yaml:"storage"`
+	Detect  DetectConfig  `yaml:"detect"`
 	Log     LogConfig     `yaml:"log"`
+}
+
+// DetectConfig 行为分析：规则引擎 + 风险评分 + 告警
+type DetectConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	WebhookURL string `yaml:"webhook_url"` // 可选：告警推送到 webhook
 }
 
 type ServerConfig struct {
@@ -33,6 +40,12 @@ type AuthConfig struct {
 	SuccessProbability float64  `yaml:"success_probability"`
 	DelayMS            []int    `yaml:"delay_ms"`
 	WeakPasswords      []string `yaml:"weak_passwords"`
+	// 认证方法开关（默认全开，模拟真实 OpenSSH 行为）
+	KeyboardInteractive bool `yaml:"keyboard_interactive"`
+	PublicKey           bool `yaml:"publickey"`
+	// 允许"探测性登录"：真实服务器若配置了 NOPASSWD 用户会直接放行。
+	// 蜜罐中用于制造高价值会话，默认关闭。
+	AllowNoAuth bool `yaml:"allow_no_auth"`
 }
 
 type VFSConfig struct {
@@ -61,9 +74,12 @@ func Default() *Config {
 			ServerVersion: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6",
 		},
 		Auth: AuthConfig{
-			SuccessProbability: 0.02,
-			DelayMS:            []int{200, 800},
-			WeakPasswords:      []string{"root", "admin", "password", "123456"},
+			SuccessProbability:  0.02,
+			DelayMS:             []int{200, 800},
+			WeakPasswords:       []string{"root", "admin", "password", "123456"},
+			KeyboardInteractive: true,
+			PublicKey:           true,
+			AllowNoAuth:         false,
 		},
 		VFS: VFSConfig{
 			Hostname: "ubuntu-web-01",
@@ -72,6 +88,10 @@ func Default() *Config {
 		Storage: StorageConfig{
 			DataDir: "data",
 			Driver:  "sqlite,jsonl",
+		},
+		Detect: DetectConfig{
+			Enabled:    true,
+			WebhookURL: "",
 		},
 		Log: LogConfig{Level: "info"},
 	}
@@ -111,6 +131,11 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Auth.DelayMS) != 2 || c.Auth.DelayMS[0] < 0 || c.Auth.DelayMS[1] < c.Auth.DelayMS[0] {
 		return fmt.Errorf("auth.delay_ms must be [min, max] with max >= min >= 0")
+	}
+	if !c.Auth.KeyboardInteractive && !c.Auth.PublicKey && c.Auth.SuccessProbability > 0 {
+		// yaml 未显式配置（零值 false）时保持默认开启，模拟真实 OpenSSH
+		c.Auth.KeyboardInteractive = true
+		c.Auth.PublicKey = true
 	}
 	if c.Storage.DataDir == "" {
 		c.Storage.DataDir = "data"

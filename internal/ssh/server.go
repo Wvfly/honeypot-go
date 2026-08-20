@@ -2,6 +2,7 @@
 package sshsrv
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"honeypot-go/internal/auth"
@@ -24,6 +26,26 @@ import (
 	"honeypot-go/internal/tty"
 	"honeypot-go/internal/vfs"
 )
+
+// nl2crlf 把 LF 转为 CRLF（除非前面已有 CR），用于在写到 SSH channel 前做 ONLCR 转换。
+// x/crypto/ssh 不像 OpenSSH sshd 那样在 PTY 模式下自动做 ONLCR，
+// 蜜罐 executor 的命令输出用 \n 结尾，Windows Terminal / MobaXterm 等客户端
+// 的 PTY 终端在收到裸 \n 时光标只下移一格（不回到行首），下一行从上一行的列位置开始，
+// 形成"阶梯状"错位；统一转为 \r\n 即可对齐到行首。
+func nl2crlf(b []byte) []byte {
+	if !bytes.Contains(b, []byte{'\n'}) {
+		return b
+	}
+	out := make([]byte, 0, len(b)+8)
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c == '\n' && (i == 0 || b[i-1] != '\r') {
+			out = append(out, '\r')
+		}
+		out = append(out, c)
+	}
+	return out
+}
 
 // Server 蜜罐 SSH 服务端
 type Server struct {
@@ -159,6 +181,23 @@ func (s *Server) handleConn(nc net.Conn) {
 			return nil, fmt.Errorf("authentication failed")
 		},
 	}
+	if s.cfg.Auth.KeyboardInteractive {
+		serverConfig.KeyboardInteractiveCallback = func(cm ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			if s.auth.CheckKeyboardInteractive(connID, cm.User(), challenge) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, fmt.Errorf("authentication failed")
+		}
+	}
+	if s.cfg.Auth.PublicKey {
+		serverConfig.PublicKeyCallback = func(cm ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			s.auth.CheckPublicKey(connID, cm.User(), key)
+			return nil, fmt.Errorf("unknown public key")
+		}
+	}
+	if s.cfg.Auth.AllowNoAuth {
+		serverConfig.NoClientAuth = true
+	}
 	serverConfig.AddHostKey(s.hostSigner)
 
 	conn, chans, reqs, err := ssh.NewServerConn(nc, serverConfig)
@@ -276,8 +315,9 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 			createSession("exec")
 			_, res := s.exec.Execute(sess.ID, sess.Cwd(), p.Command)
 			if len(res.Output) > 0 {
-				_, _ = ch.Write(res.Output)
-				sess.RecordOutput(res.Output)
+				out := nl2crlf(res.Output)
+				_, _ = ch.Write(out)
+				sess.RecordOutput(out)
 			}
 			closeSession()
 			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(res.Code)}))
@@ -292,9 +332,25 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 			return
 
 		case "subsystem":
-			// M2 支持 sftp；当前拒绝
-			_ = req.Reply(false, nil)
-			_, _ = ch.Write([]byte("subsystem request failed on channel 0\r\n"))
+			name := ""
+			if len(req.Payload) >= 4 {
+				name = string(req.Payload[4:])
+			}
+			if name != "sftp" {
+				_ = req.Reply(false, nil)
+				return
+			}
+			_ = req.Reply(true, nil)
+			createSession("subsystem")
+			handler := &vfsHandler{fs: s.fs, bus: s.bus, sessionID: sess.ID}
+			srv := sftp.NewRequestServer(ch, sftp.Handlers{
+				FileGet:  handler,
+				FilePut:  handler,
+				FileCmd:  handler,
+				FileList: handler,
+			})
+			_ = srv.Serve()
+			closeSession()
 			return
 
 		default:
@@ -307,8 +363,9 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 // runInteractiveShell 交互式 shell 循环：回显按键、逐行执行命令
 func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
 	prompt := sess.Prompt()
-	_, _ = ch.Write([]byte(prompt))
-	sess.RecordOutput([]byte(prompt))
+	promptOut := nl2crlf([]byte(prompt))
+	_, _ = ch.Write(promptOut)
+	sess.RecordOutput(promptOut)
 
 	line := make([]byte, 0, 256)
 	buf := make([]byte, 4096)
@@ -332,11 +389,13 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session) {
 				}
 				out := sess.ExecuteLine(cmd)
 				if len(out) > 0 {
+					out = nl2crlf(out)
 					_, _ = ch.Write(out)
 					sess.RecordOutput(out)
 				}
-				_, _ = ch.Write([]byte(sess.Prompt()))
-				sess.RecordOutput([]byte(sess.Prompt()))
+				promptOut := nl2crlf([]byte(sess.Prompt()))
+				_, _ = ch.Write(promptOut)
+				sess.RecordOutput(promptOut)
 
 			case 0x03: // Ctrl-C
 				line = line[:0]

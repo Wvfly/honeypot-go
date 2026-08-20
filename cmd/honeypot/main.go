@@ -12,6 +12,7 @@ import (
 
 	"honeypot-go/internal/auth"
 	"honeypot-go/internal/config"
+	"honeypot-go/internal/detect"
 	"honeypot-go/internal/event"
 	sshsrv "honeypot-go/internal/ssh"
 	"honeypot-go/internal/store"
@@ -43,6 +44,12 @@ func main() {
 		os.Exit(1)
 	}
 	go st.Run(ctx)
+
+	// 行为分析：规则引擎 + 风险评分 + 告警
+	if cfg.Detect.Enabled {
+		det := detect.New(cfg.Detect, bus, logger)
+		go det.Run(ctx)
+	}
 
 	// 认证欺骗层
 	authn := auth.New(cfg.Auth, bus, logger)

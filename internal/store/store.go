@@ -17,6 +17,14 @@ import (
 	"honeypot-go/internal/event"
 )
 
+// flushInterval SQLite 批量落盘周期：事件先攒批，每间隔或攒满一批再以单事务提交。
+// 原因：modernc.org/sqlite 在 Windows 上每条 Exec 自动提交（创建/删除 journal + fsync）
+// 实测耗时 70~190ms，单条提交会把 store 拖到积压直至阻塞；批量后 <2ms/条。
+const (
+	flushInterval = 250 * time.Millisecond
+	flushBatch    = 128
+)
+
 // Store 事件消费者：把事件总线上的事件持久化到 SQLite（结构化表）+ JSONL（原始流水）。
 type Store struct {
 	cfg    config.StorageConfig
@@ -26,7 +34,6 @@ type Store struct {
 	db *sql.DB
 	jl *jsonlWriter
 
-	ch        chan event.Event
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 }
@@ -36,7 +43,7 @@ func New(cfg config.StorageConfig, bus *event.Bus, logger *slog.Logger) (*Store,
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	s := &Store{cfg: cfg, bus: bus, logger: logger, ch: make(chan event.Event, 512)}
+	s := &Store{cfg: cfg, bus: bus, logger: logger}
 
 	if cfg.UseSQLite() {
 		db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "honeypot.db"))
@@ -57,7 +64,7 @@ func New(cfg config.StorageConfig, bus *event.Bus, logger *slog.Logger) (*Store,
 	return s, nil
 }
 
-// Run 启动消费循环，阻塞直到 ctx 取消
+// Run 启动消费循环，阻塞直到 ctx 取消。事件攒批后批量落盘。
 func (s *Store) Run(ctx context.Context) {
 	s.wg.Add(1)
 	defer s.wg.Done()
@@ -65,17 +72,36 @@ func (s *Store) Run(ctx context.Context) {
 	ch := s.bus.Subscribe()
 	defer s.bus.Unsubscribe(ch)
 
+	var pending []event.Event
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		s.flush(pending)
+		pending = pending[:0]
+	}
+	defer flush()
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case ev := <-ch:
-			s.handle(ev)
+			pending = append(pending, ev)
+			if len(pending) >= flushBatch {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
 		case <-ctx.Done():
 			// 兜底处理剩余事件
 			for {
 				select {
 				case ev := <-ch:
-					s.handle(ev)
+					pending = append(pending, ev)
 				default:
+					flush()
 					return
 				}
 			}
@@ -96,33 +122,52 @@ func (s *Store) Close() {
 	})
 }
 
-func (s *Store) handle(ev event.Event) {
+// flush 批量持久化一批事件：JSONL 逐条 append；SQLite 单事务批量提交。
+func (s *Store) flush(events []event.Event) {
 	if s.jl != nil {
-		if err := s.jl.write(ev); err != nil {
-			s.logger.Warn("write jsonl failed", "error", err)
+		for _, ev := range events {
+			if err := s.jl.write(ev); err != nil {
+				s.logger.Warn("write jsonl failed", "error", err)
+			}
 		}
 	}
 	if s.db == nil {
 		return
 	}
-	switch ev.Type {
-	case event.TypeConnectionOpened:
-		s.insertConnectionOpened(ev)
-	case event.TypeConnectionClosed:
-		s.insertConnectionClosed(ev)
-	case event.TypeAuthAttempt:
-		s.insertAuthAttempt(ev)
-	case event.TypeSessionOpened:
-		s.insertSessionOpened(ev)
-	case event.TypeSessionClosed:
-		s.insertSessionClosed(ev)
-	case event.TypeCommandExecuted:
-		s.insertCommand(ev)
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.logger.Warn("begin sqlite tx failed", "error", err)
+		return
+	}
+	for _, ev := range events {
+		switch ev.Type {
+		case event.TypeConnectionOpened:
+			s.insertConnectionOpened(tx, ev)
+		case event.TypeConnectionClosed:
+			s.insertConnectionClosed(tx, ev)
+		case event.TypeAuthAttempt:
+			s.insertAuthAttempt(tx, ev)
+		case event.TypeSessionOpened:
+			s.insertSessionOpened(tx, ev)
+		case event.TypeSessionClosed:
+			s.insertSessionClosed(tx, ev)
+		case event.TypeCommandExecuted:
+			s.insertCommand(tx, ev)
+		case event.TypeDownloadAttempt, event.TypeConnectAttempt, event.TypeFileWritten, event.TypeAlert:
+			s.insertGeneric(tx, ev)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		s.logger.Warn("commit sqlite tx failed", "error", err)
 	}
 }
 
 func (s *Store) migrate() error {
 	stmts := []string{
+		// 写性能优化：关闭每条语句的同步 fsync、设置忙等超时，避免 Windows 上逐条自动提交过慢
+		`PRAGMA journal_mode=DELETE`,
+		`PRAGMA synchronous=NORMAL`,
+		`PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS connections (
 			id TEXT PRIMARY KEY,
 			opened_at TEXT,
@@ -162,8 +207,17 @@ func (s *Store) migrate() error {
 			duration_ms INTEGER,
 			output_preview TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			type TEXT,
+			ts TEXT,
+			connection_id TEXT,
+			session_id TEXT,
+			payload TEXT
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_auth_conn ON auth_attempts(connection_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_cmd_session ON commands(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -173,8 +227,20 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-func (s *Store) insertConnectionOpened(ev event.Event) {
-	_, _ = s.db.Exec(
+// insertGeneric M2 扩展事件（下载/连接/文件写入/告警）统一入 events 表
+func (s *Store) insertGeneric(tx *sql.Tx, ev event.Event) {
+	payload, err := json.Marshal(ev.Data)
+	if err != nil {
+		return
+	}
+	_, _ = tx.Exec(
+		`INSERT INTO events (type, ts, connection_id, session_id, payload) VALUES (?, ?, ?, ?, ?)`,
+		string(ev.Type), ev.Time.Format(time.RFC3339Nano),
+		ev.Data["connection_id"], ev.Data["session_id"], string(payload))
+}
+
+func (s *Store) insertConnectionOpened(tx *sql.Tx, ev event.Event) {
+	_, _ = tx.Exec(
 		`INSERT OR IGNORE INTO connections (id, opened_at, source_ip, source_port, target_port, client_version)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		ev.Data["connection_id"], ev.Time.Format(time.RFC3339Nano),
@@ -182,18 +248,18 @@ func (s *Store) insertConnectionOpened(ev event.Event) {
 		ev.Data["client_version"])
 }
 
-func (s *Store) insertConnectionClosed(ev event.Event) {
-	_, _ = s.db.Exec(
+func (s *Store) insertConnectionClosed(tx *sql.Tx, ev event.Event) {
+	_, _ = tx.Exec(
 		`UPDATE connections SET closed_at = ?, client_version = COALESCE(NULLIF(?, ''), client_version) WHERE id = ?`,
 		ev.Time.Format(time.RFC3339Nano), ev.Data["client_version"], ev.Data["connection_id"])
 }
 
-func (s *Store) insertAuthAttempt(ev event.Event) {
+func (s *Store) insertAuthAttempt(tx *sql.Tx, ev event.Event) {
 	success := 0
 	if b, _ := ev.Data["success"].(bool); b {
 		success = 1
 	}
-	_, _ = s.db.Exec(
+	_, _ = tx.Exec(
 		`INSERT INTO auth_attempts (connection_id, ts, username, password, method, success, delay_ms)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ev.Data["connection_id"], ev.Time.Format(time.RFC3339Nano),
@@ -201,8 +267,8 @@ func (s *Store) insertAuthAttempt(ev event.Event) {
 		success, ev.Data["delay_ms"])
 }
 
-func (s *Store) insertSessionOpened(ev event.Event) {
-	_, _ = s.db.Exec(
+func (s *Store) insertSessionOpened(tx *sql.Tx, ev event.Event) {
+	_, _ = tx.Exec(
 		`INSERT OR IGNORE INTO sessions (id, connection_id, channel_type, term, cols, rows, opened_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ev.Data["session_id"], ev.Data["connection_id"], ev.Data["channel_type"],
@@ -210,14 +276,14 @@ func (s *Store) insertSessionOpened(ev event.Event) {
 		ev.Time.Format(time.RFC3339Nano))
 }
 
-func (s *Store) insertSessionClosed(ev event.Event) {
-	_, _ = s.db.Exec(
+func (s *Store) insertSessionClosed(tx *sql.Tx, ev event.Event) {
+	_, _ = tx.Exec(
 		`UPDATE sessions SET closed_at = ? WHERE id = ?`,
 		ev.Time.Format(time.RFC3339Nano), ev.Data["session_id"])
 }
 
-func (s *Store) insertCommand(ev event.Event) {
-	_, _ = s.db.Exec(
+func (s *Store) insertCommand(tx *sql.Tx, ev event.Event) {
+	_, _ = tx.Exec(
 		`INSERT INTO commands (session_id, ts, command, cwd, exit_code, duration_ms, output_preview)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ev.Data["session_id"], ev.Time.Format(time.RFC3339Nano),

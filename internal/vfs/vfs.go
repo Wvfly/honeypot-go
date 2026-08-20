@@ -2,6 +2,8 @@ package vfs
 
 import (
 	"fmt"
+	fsys "io/fs"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -194,6 +196,37 @@ func (fs *FileSystem) List(path string) ([]FileInfo, error) {
 	return out, nil
 }
 
+// ReadDir2 返回目录条目（io/fs.DirEntry），供 shell 通配符展开
+func (fs *FileSystem) ReadDir2(path string) ([]fsys.DirEntry, error) {
+	infos, err := fs.List(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fsys.DirEntry, 0, len(infos))
+	for _, fi := range infos {
+		out = append(out, vfsDirEntry{name: fi.Name, isDir: fi.IsDir})
+	}
+	return out, nil
+}
+
+// vfsDirEntry 实现 io/fs.DirEntry
+type vfsDirEntry struct {
+	name  string
+	isDir bool
+}
+
+func (d vfsDirEntry) Name() string { return d.name }
+func (d vfsDirEntry) IsDir() bool  { return d.isDir }
+func (d vfsDirEntry) Type() fsys.FileMode {
+	if d.isDir {
+		return fsys.ModeDir
+	}
+	return 0
+}
+func (d vfsDirEntry) Info() (fsys.FileInfo, error) {
+	return nil, fmt.Errorf("Info not supported")
+}
+
 // ReadFile 读取文件内容（/proc 下动态生成）
 func (fs *FileSystem) ReadFile(path string) ([]byte, error) {
 	fs.mu.RLock()
@@ -217,6 +250,83 @@ func (fs *FileSystem) IsDir(path string) bool {
 	defer fs.mu.RUnlock()
 	n, ok := fs.resolve(path)
 	return ok && n.isDir
+}
+
+// WriteFile 覆盖写入（父目录必须存在），M2 用于 echo > / wget 落盘
+func (fs *FileSystem) WriteFile(path string, data []byte) error {
+	return fs.write(path, data, false)
+}
+
+// AppendFile 追加写入，用于 echo >>
+func (fs *FileSystem) AppendFile(path string, data []byte) error {
+	return fs.write(path, data, true)
+}
+
+func (fs *FileSystem) write(path string, data []byte, appendMode bool) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return fmt.Errorf("invalid path")
+	}
+	dir := fs.root
+	for _, p := range parts[:len(parts)-1] {
+		next, ok := dir.children[p]
+		if !ok || !next.isDir {
+			return fmt.Errorf("no such directory")
+		}
+		dir = next
+	}
+	name := parts[len(parts)-1]
+	n, exists := dir.children[name]
+	if !exists {
+		n = &node{name: name, perm: "-rw-r--r--", owner: "root", group: "root", mtime: time.Now()}
+		dir.children[name] = n
+	} else if n.isDir {
+		return fmt.Errorf("is a directory")
+	}
+	if appendMode {
+		n.content = append(n.content, data...)
+	} else {
+		n.content = append([]byte(nil), data...)
+	}
+	n.size = int64(len(n.content))
+	n.mtime = time.Now()
+	return nil
+}
+
+// Glob 通配符匹配（支持末层 * ? []），返回绝对路径列表，供 shell 字段展开
+func (fs *FileSystem) Glob(pattern string) []string {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	idx := strings.LastIndex(pattern, "/")
+	dirPart, basePart := "/", pattern
+	if idx >= 0 {
+		dirPart, basePart = pattern[:idx], pattern[idx+1:]
+	}
+	hasMeta := strings.ContainsAny(basePart, "*?[")
+	if !hasMeta {
+		if _, ok := fs.resolve(pattern); ok {
+			return []string{pattern}
+		}
+		return nil
+	}
+	dirNode, ok := fs.resolve(dirPart)
+	if !ok || !dirNode.isDir {
+		return nil
+	}
+	var out []string
+	for name, child := range dirNode.children {
+		if ok, _ := path.Match(basePart, name); ok {
+			p := strings.TrimSuffix(dirPart, "/") + "/" + name
+			if child.isDir {
+				p += "/"
+			}
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // procContent 动态生成 /proc 下内容

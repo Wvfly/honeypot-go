@@ -12,6 +12,12 @@ const (
 	TypeSessionOpened    Type = "session.opened"
 	TypeSessionClosed    Type = "session.closed"
 	TypeCommandExecuted  Type = "command.executed"
+	// M2：网络仿真与文件投递
+	TypeDownloadAttempt Type = "network.download_attempt"
+	TypeConnectAttempt  Type = "network.connect_attempt"
+	TypeFileWritten     Type = "file.written"
+	// M2：行为分析告警
+	TypeAlert Type = "alert"
 )
 
 // Event 统一事件模型：类型 + 时间戳 + 键值数据

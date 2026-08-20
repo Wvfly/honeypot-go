@@ -17,6 +17,12 @@ auth:
   success_probability: 0.05
   # 认证模拟延迟范围（毫秒），模拟真实密码哈希校验耗时
   delay_ms: [200, 800]
+  # 认证方法开关（默认开启，模拟真实 OpenSSH 多方法探测）
+  keyboard_interactive: true
+  publickey: true
+  # 允许探测性登录：真实服务器若配置 NOPASSWD 用户会直接放行，
+  # 蜜罐中用于制造高价值会话，默认关闭
+  allow_no_auth: false
   weak_passwords:
     - root
     - admin
@@ -52,6 +58,12 @@ storage:
   data_dir: "data"
   # 存储驱动: sqlite | jsonl（sqlite 为主存储，jsonl 为原始事件流水，二者可同时启用，逗号分隔）
   driver: "sqlite,jsonl"
+
+detect:
+  # 行为分析：规则引擎 + 连接级风险评分 + 告警
+  enabled: true
+  # 可选：命中规则后推送到 webhook（JSON POST，如飞书/钉钉/Slack 机器人）
+  webhook_url: ""
 
 log:
   level: "info"
