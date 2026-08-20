@@ -1,5 +1,11 @@
 # honeypot-go
 
+![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)
+![Status](https://img.shields.io/badge/Status-M1%20MVP-orange)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-4EAA25)
+![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+[中文文档](README.md) | [English](README.en.md)
+
 一个基于 Go 的高交互 SSH 蜜罐框架。以极低的真实风险诱捕、记录、分析攻击者的完整攻击链：**扫描 → 爆破 → 登录 → 侦察 → 载荷投递 → 横向移动**。
 
 所有命令、文件、网络行为均在**用户态仿真**执行，蜜罐自身永不受"中毒"；默认禁止一切真实出站，杜绝被用作跳板。
@@ -55,6 +61,33 @@ ssh -p 2222 root@127.0.0.1
 
 ```bash
 go run ./cmd/dbquery        # 查看捕获的全部攻击事件
+```
+
+### 运行效果示例（冒烟测试实测输出）
+
+```
+$ ssh -p 2222 root@127.0.0.1
+root@ubuntu-web-01:~# whoami
+root
+root@ubuntu-web-01:~# uname -a
+Linux ubuntu-web-01 5.15.0-91-generic #101-Ubuntu SMP ... x86_64 GNU/Linux
+root@ubuntu-web-01:~# cat /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+ubuntu:x:1000:1000:ubuntu:/home/ubuntu:/bin/bash
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+root@ubuntu-web-01:~# cat /etc/shadow
+root:$6$rounds=656000$ZyHdQ8m4tZ8mK0n$...:19800:0:99999:7:::
+root@ubuntu-web-01:~# exit
+```
+
+捕获结果：
+
+```
+== auth_attempts ==
+  conn_xxx | 2026-08-20T... | user=root pass=123456 method=password success=1 delay=512ms
+== commands ==
+  sess_xxx | 2026-08-20T... | cwd=/root | code=0 dur=12ms | whoami
+  sess_xxx | 2026-08-20T... | cwd=/root | code=0 dur=15ms | uname -a
 ```
 
 ---
