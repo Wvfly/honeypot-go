@@ -1,0 +1,57 @@
+# honeypot-go 示例配置
+# 复制到 data/honeypot.yaml 或通过 -config 指定
+
+server:
+  listen:
+    - "0.0.0.0:2222"
+    - "0.0.0.0:22222"
+  max_connections: 500
+  idle_timeout: 5m
+
+ssh:
+  # 伪装为真实 OpenSSH 版本，降低被识别为蜜罐的概率
+  server_version: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
+
+auth:
+  # 命中弱口令库后允许"登录成功"的概率（制造高价值会话）
+  success_probability: 0.05
+  # 认证模拟延迟范围（毫秒），模拟真实密码哈希校验耗时
+  delay_ms: [200, 800]
+  weak_passwords:
+    - root
+    - admin
+    - password
+    - 123456
+    - 12345678
+    - 123456789
+    - 12345
+    - 1234
+    - 111111
+    - qwerty
+    - abc123
+    - password123
+    - admin123
+    - root123
+    - toor
+    - test
+    - guest
+    - ubuntu
+    - changeme
+    - letmein
+    - 654321
+    - 666666
+    - 888888
+
+vfs:
+  # 虚拟主机名，用于 prompt、/etc/hostname 等
+  hostname: "ubuntu-web-01"
+  # 预置的虚拟用户（/etc/passwd）
+  users: ["root", "ubuntu", "www-data"]
+
+storage:
+  data_dir: "data"
+  # 存储驱动: sqlite | jsonl（sqlite 为主存储，jsonl 为原始事件流水，二者可同时启用，逗号分隔）
+  driver: "sqlite,jsonl"
+
+log:
+  level: "info"

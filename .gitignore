@@ -1,0 +1,56 @@
+# ===== 运行时数据 =====
+# 蜜罐运行时产物：数据库、事件流水、会话录制、主机密钥
+data/
+# 但保留仓库中提交的配置样例（data/test.yaml 等）
+!data/
+!data/*.yaml
+!data/.gitkeep
+
+# SQLite 附属文件（WAL/SHM 模式）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 会话录制与事件流水
+*.ttyrec
+*.jsonl
+
+# 蜜罐 SSH 主机密钥（机密，绝不可提交）
+host_key
+host_key.pub
+
+# ===== 构建产物 =====
+# Windows
+*.exe
+*.dll
+# 根目录 Linux 交叉编译产物
+/honeypot-linux-*
+/ttyshow-linux-*
+# 根目录无扩展名二进制（锚定根，避免误伤 cmd/honeypot/ 源码目录）
+/honeypot
+/ttyshow
+# 其他平台
+*.so
+*.dylib
+bin/
+dist/
+build/
+*.test
+
+# ===== 日志 =====
+*.log
+*.err
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# ===== OS 垃圾 =====
+Thumbs.db
+desktop.ini
+.DS_Store
