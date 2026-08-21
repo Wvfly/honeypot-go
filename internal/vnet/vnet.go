@@ -6,21 +6,37 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"honeypot-go/internal/event"
 )
 
+// DownloadSink 下载内容落盘回调（宿主注入）：path 为绝对路径，data 为仿真下载内容。
+// 由宿主写入虚拟文件系统（含父目录可写/大小上限等校验），不触碰真实磁盘。
+type DownloadSink func(path string, data []byte) error
+
 // VNet 网络仿真器
 type VNet struct {
 	bus    *event.Bus
 	logger *slog.Logger
+
+	// 下载落盘支持（wget/curl 仿真保存到虚拟文件系统）
+	sink  DownloadSink
+	cwdFn func(sessionID string) string
 }
 
 // New 创建网络仿真器
 func New(bus *event.Bus, logger *slog.Logger) *VNet {
 	return &VNet{bus: bus, logger: logger}
+}
+
+// SetDownload 注入下载落盘回调与会话工作目录提供者（均需非 nil 才启用落盘）
+func (v *VNet) SetDownload(sink DownloadSink, cwdFn func(sessionID string) string) {
+	v.sink = sink
+	v.cwdFn = cwdFn
 }
 
 // Exec 执行网络命令。返回 (输出, exit code, 是否处理)。
@@ -220,36 +236,100 @@ var wgetOptsWithValue = map[string]bool{
 	"--bind-address": true, "--auth": true, "--secure-protocol": true,
 }
 
+// maxPingCount 单次 ping 最大发包数：防 `ping -c 999999` 的 200ms/包 sleep 拖死会话。
+// 总耗时上限 = 16*200ms ≈ 3.2s。
+const maxPingCount = 16
+
+// pingCount 解析 ping 参数中的发包数与目标主机。
+// 注意不能用 host() 提取目标：`ping -c 5 example.com` 中 "-c 5" 的取值会被误判为目标。
+func pingCount(args []string) (int, string) {
+	pkts := 4
+	var target string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-c" && i+1 < len(args):
+			if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
+				pkts = n
+			}
+			i++
+		case strings.HasPrefix(a, "-c") && len(a) > 2:
+			if n, err := strconv.Atoi(a[2:]); err == nil && n > 0 {
+				pkts = n
+			}
+		case a == "-i" || a == "-W" || a == "-s" || a == "-I":
+			// 带值选项：跳过其取值，防止误判为目标
+			if i+1 < len(args) {
+				i++
+			}
+		case strings.HasPrefix(a, "-"):
+			// 其它无值选项忽略
+		case target == "":
+			target = a
+		}
+	}
+	if pkts > maxPingCount {
+		pkts = maxPingCount
+	}
+	return pkts, target
+}
+
+// fakeIPv4 合成一个仿真外网 IPv4（仅展示用）
+func fakeIPv4() string {
+	return fmt.Sprintf("%d.%d.%d.%d", rand.IntN(220)+10, rand.IntN(255), rand.IntN(255), rand.IntN(254)+1)
+}
+
+// sbprintf 向 strings.Builder 写入格式化文本；Builder 的 Write 永不返回错误，
+// 这里显式忽略返回值以满足 errcheck，语义与 fmt.Fprintf(&b, ...) 完全一致。
+func sbprintf(b *strings.Builder, format string, a ...any) {
+	_, _ = fmt.Fprintf(b, format, a...)
+}
+
 func (v *VNet) ping(args []string) []byte {
-	target := host(args)
+	pkts, target := pingCount(args)
 	if target == "" {
 		target = "example.com"
 	}
 	// 合成一个"解析"出的 IP
-	fakeIP := fmt.Sprintf("%d.%d.%d.%d", rand.IntN(220)+10, rand.IntN(255), rand.IntN(255), rand.IntN(254)+1)
+	fakeIP := fakeIPv4()
 	var b strings.Builder
-	fmt.Fprintf(&b, "PING %s (%s) 56(84) bytes of data.\n", target, fakeIP)
-	pkts := 4
+	sbprintf(&b, "PING %s (%s) 56(84) bytes of data.\n", target, fakeIP)
 	for i := 1; i <= pkts; i++ {
 		rtt := 8.0 + rand.Float64()*20
-		fmt.Fprintf(&b, "64 bytes from %s: icmp_seq=%d ttl=52 time=%.1f ms\n", fakeIP, i, rtt)
+		sbprintf(&b, "64 bytes from %s: icmp_seq=%d ttl=52 time=%.1f ms\n", fakeIP, i, rtt)
 		if i < pkts {
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
 	avg := 18.0 + rand.Float64()*6
-	fmt.Fprintf(&b, "\n--- %s ping statistics ---\n", target)
-	fmt.Fprintf(&b, "%d packets transmitted, %d received, 0%% packet loss, time %dms\n", pkts, pkts, pkts*300)
-	fmt.Fprintf(&b, "rtt min/avg/max/mdev = %.2f/%.2f/%.2f/0.531 ms\n", avg-1.8, avg, avg+2.1)
+	sbprintf(&b, "\n--- %s ping statistics ---\n", target)
+	sbprintf(&b, "%d packets transmitted, %d received, 0%% packet loss, time %dms\n", pkts, pkts, pkts*300)
+	sbprintf(&b, "rtt min/avg/max/mdev = %.2f/%.2f/%.2f/0.531 ms\n", avg-1.8, avg, avg+2.1)
 	return []byte(b.String())
 }
 
 func (v *VNet) curl(sessionID string, args []string) []byte {
 	target := firstURL(args, curlOptsWithValue)
 	v.recordDownload(sessionID, "curl", target)
-	body := "#!/bin/bash\n# (download decoy)\n"
-	return []byte(fmt.Sprintf("  %% Total    %% Received %% Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n100   %d  100   %d    0     0   %d      0      0:00:00 --:--:--     0   %d\n",
-		len(body), len(body), len(body)*2, len(body)*2))
+	body := downloadBody(target, "output.html")
+	// 无 -o 时 curl 将响应体输出到 stdout；有 -o 时落盘
+	outFile := optionValue(args, "-o", "--output")
+	if outFile != "" {
+		if !safeDownloadPath(outFile) {
+			return []byte(fmt.Sprintf("curl: (23) Failed writing body: Invalid path '%s'\n", outFile))
+		}
+		abs := v.resolveWritePath(sessionID, outFile)
+		if err := v.save(abs, body); err != nil {
+			return []byte(fmt.Sprintf("curl: (23) Failed writing body: %s\n", err))
+		}
+	}
+	var b strings.Builder
+	sbprintf(&b, "  %% Total    %% Received %% Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n")
+	sbprintf(&b, "100   %d  100   %d    0     0   %d      0      0:00:00 --:--:--     0   %d\n", len(body), len(body), len(body)*2, len(body)*2)
+	if outFile == "" {
+		b.Write(body)
+	}
+	return []byte(b.String())
 }
 
 func (v *VNet) wget(sessionID string, args []string) []byte {
@@ -258,21 +338,138 @@ func (v *VNet) wget(sessionID string, args []string) []byte {
 		target = "http://example.com/"
 	}
 	v.recordDownload(sessionID, "wget", target)
-	// 从 URL 提取文件名
+	// 从 URL 提取文件名（去 query/fragment）
+	base := target
+	if i := strings.IndexAny(base, "?#"); i >= 0 {
+		base = base[:i]
+	}
 	fname := "index.html"
-	if i := strings.LastIndex(target, "/"); i >= 0 && i < len(target)-1 {
-		fname = target[i+1:]
+	if i := strings.LastIndex(base, "/"); i >= 0 && i < len(base)-1 {
+		fname = base[i+1:]
+	}
+	if fname == "" || fname == "." || fname == ".." {
+		fname = "index.html"
+	}
+	// -O/--output-document 覆盖输出名
+	if o := optionValue(args, "-O", "--output-document"); o != "" {
+		fname = o
+	}
+	if !safeDownloadPath(fname) {
+		return []byte(fmt.Sprintf("wget: cannot write to '%s': No such file or directory\n", fname))
+	}
+	body := downloadBody(target, fname)
+	if err := v.save(v.resolveWritePath(sessionID, fname), body); err != nil {
+		return []byte(fmt.Sprintf("wget: cannot write to '%s': %s\n", fname, err))
 	}
 	now := time.Now().Format("2006-01-02 15:04:05")
 	var b strings.Builder
-	fmt.Fprintf(&b, "--%s--  %s\n", now, target)
-	fmt.Fprintf(&b, "Resolving %s... done.\n", target)
-	fmt.Fprintf(&b, "HTTP request sent, awaiting response... 200 OK\n")
-	fmt.Fprintf(&b, "Length: 1234 (1.2K) [application/octet-stream]\n")
-	fmt.Fprintf(&b, "Saving to: '%s'\n\n", fname)
-	fmt.Fprintf(&b, "%s    100%%[===================>]   1.2K  --.-KB/s    in 0s\n\n", fname)
-	fmt.Fprintf(&b, "%s (%s) - '%s' saved [1234/1234]\n", now, "2.35 MB/s", fname)
+	sbprintf(&b, "--%s--  %s\n", now, target)
+	sbprintf(&b, "Resolving %s... done.\n", target)
+	sbprintf(&b, "HTTP request sent, awaiting response... 200 OK\n")
+	sbprintf(&b, "Length: %d (%s) [application/octet-stream]\n", len(body), humanBytes(len(body)))
+	sbprintf(&b, "Saving to: '%s'\n\n", fname)
+	sbprintf(&b, "%s    100%%[===================>] %s  --.-KB/s    in 0s\n\n", fname, humanBytes(len(body)))
+	sbprintf(&b, "%s (%s) - '%s' saved [%d/%d]\n", now, "2.35 MB/s", fname, len(body), len(body))
 	return []byte(b.String())
+}
+
+// resolveWritePath 将下载输出路径解析为绝对虚拟路径：
+// 相对路径基于会话 cwd（未注入 cwdFn 时保持相对路径交给宿主解析）。
+func (v *VNet) resolveWritePath(sessionID, p string) string {
+	if strings.HasPrefix(p, "/") {
+		return p
+	}
+	if v.cwdFn != nil {
+		if cwd := v.cwdFn(sessionID); cwd != "" {
+			return path.Join(cwd, p)
+		}
+	}
+	return p
+}
+
+// save 调用宿主落盘回调（未注入时静默跳过，仅仿真输出）
+func (v *VNet) save(p string, data []byte) error {
+	if v.sink == nil {
+		return nil
+	}
+	return v.sink(p, data)
+}
+
+// safeDownloadPath 拒绝包含 ".." 段的输出路径，防止通过 wget/curl 写穿虚拟目录结构。
+func safeDownloadPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	for _, seg := range strings.Split(path.Clean(p), "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// maxDownloadBytes 仿真下载内容上限：防超大参数导致内容生成占用内存（1 MiB）
+const maxDownloadBytes = 1 << 20
+
+// downloadBody 生成仿真下载内容：按扩展名给类型，固定 1234 字节与输出文案一致。
+func downloadBody(url, fname string) []byte {
+	lower := strings.ToLower(fname)
+	var head string
+	switch {
+	case strings.HasSuffix(lower, ".sh"):
+		head = "#!/bin/bash\n# retrieved from " + url + "\n"
+	case strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".htm"):
+		head = "<!DOCTYPE html>\n<html><head><title>" + fname + "</title></head>\n<body>\n<h1>" + fname + "</h1>\n<p>decoy page retrieved from " + url + "</p>\n</body></html>\n"
+	case strings.HasSuffix(lower, ".conf") || strings.HasSuffix(lower, ".cnf"):
+		head = "# config retrieved from " + url + "\n"
+	default:
+		head = "# " + fname + " retrieved from " + url + "\n"
+	}
+	const size = 1234
+	if len(head) >= size {
+		return []byte(head[:size])
+	}
+	pad := "# download simulation\n"
+	body := head
+	for len(body)+len(pad) <= size {
+		body += pad
+	}
+	if len(body) < size {
+		body += strings.Repeat("#", size-len(body))
+	}
+	return []byte(body)
+}
+
+// optionValue 解析短/长带值选项：支持 "-O x"、"-Ox"、"--output-document=x" 形式。
+func optionValue(args []string, short, long string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == short && i+1 < len(args) {
+			return args[i+1]
+		}
+		if short != "" && strings.HasPrefix(a, short) && len(a) > len(short) {
+			return a[len(short):]
+		}
+		if a == long && i+1 < len(args) {
+			return args[i+1]
+		}
+		if long != "" && strings.HasPrefix(a, long+"=") {
+			return a[len(long)+1:]
+		}
+	}
+	return ""
+}
+
+// humanBytes 将字节数格式化为人类可读（1.2K / 1.5M）
+func humanBytes(n int) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fK", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 func (v *VNet) nc(sessionID string, args []string) []byte {
@@ -301,13 +498,13 @@ func (v *VNet) traceroute(args []string) []byte {
 		target = "8.8.8.8"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "traceroute to %s (%s), 30 hops max, 60 byte packets\n", target, target)
+	sbprintf(&b, "traceroute to %s (%s), 30 hops max, 60 byte packets\n", target, target)
 	hops := rand.IntN(6) + 3
 	for i := 1; i <= hops; i++ {
 		ip := fmt.Sprintf("10.0.%d.%d", i, rand.IntN(250)+1)
-		fmt.Fprintf(&b, " %2d  %s (%s)  %.3f ms  %.3f ms  %.3f ms\n", i, ip, ip, rand.Float64()*3, rand.Float64()*3, rand.Float64()*3)
+		sbprintf(&b, " %2d  %s (%s)  %.3f ms  %.3f ms  %.3f ms\n", i, ip, ip, rand.Float64()*3, rand.Float64()*3, rand.Float64()*3)
 	}
-	fmt.Fprintf(&b, " %2d  %s (%s)  %.3f ms  %.3f ms  %.3f ms\n", hops+1, target, target, rand.Float64()*30, rand.Float64()*30, rand.Float64()*30)
+	sbprintf(&b, " %2d  %s (%s)  %.3f ms  %.3f ms  %.3f ms\n", hops+1, target, target, rand.Float64()*30, rand.Float64()*30, rand.Float64()*30)
 	return []byte(b.String())
 }
 
@@ -340,12 +537,76 @@ func (v *VNet) ip(args []string) []byte {
 	return []byte("Usage: ip [ OPTIONS ] OBJECT { COMMAND | help }\n")
 }
 
+// dnsTypes 支持的查询类型（dig example.com MX / dig -t AAAA example.com）
+var dnsTypes = map[string]bool{
+	"A": true, "AAAA": true, "MX": true, "TXT": true, "NS": true,
+	"CNAME": true, "SOA": true, "PTR": true, "ANY": true, "SRV": true,
+}
+
 func (v *VNet) dns(args []string) []byte {
-	target := host(args)
+	qtype := "A"
+	var positional []string
+	// 跳过 args[0]（命令名 dig/host/nslookup），只解析参数
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case (a == "-t" || a == "-type" || a == "-q") && i+1 < len(args):
+			qtype = strings.ToUpper(args[i+1])
+			i++
+		case strings.HasPrefix(a, "-"):
+			// 其它选项忽略
+		default:
+			positional = append(positional, a)
+		}
+	}
+	target := ""
+	if len(positional) > 0 {
+		// dig 允许裸类型关键字：`dig example.com MX`
+		if dnsTypes[strings.ToUpper(positional[len(positional)-1])] {
+			qtype = strings.ToUpper(positional[len(positional)-1])
+			positional = positional[:len(positional)-1]
+		}
+	}
+	if len(positional) > 0 {
+		target = positional[0]
+	}
 	if target == "" {
 		target = "example.com"
 	}
-	return []byte(fmt.Sprintf("; <<>> DiG 9.18.1-1ubuntu1.3-Ubuntu <<>> %s\n;; ANSWER SECTION:\n%s.\t\t300\tIN\tA\t93.184.216.34\n", target, target))
+
+	var b strings.Builder
+	sbprintf(&b, "; <<>> DiG 9.18.1-1ubuntu1.3-Ubuntu <<>> %s %s\n", target, qtype)
+	sbprintf(&b, ";; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: %d\n", rand.IntN(60000)+1000)
+	sbprintf(&b, ";; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1\n\n")
+	sbprintf(&b, ";; OPT PSEUDOSECTION:\n; EDNS: version: 0, flags:; udp: 1232\n")
+	sbprintf(&b, ";; QUESTION SECTION:\n;%s.\t\t\tIN\t%s\n\n", target, qtype)
+	sbprintf(&b, ";; ANSWER SECTION:\n")
+	switch qtype {
+	case "AAAA":
+		sbprintf(&b, "%s.\t\t300\tIN\tAAAA\t::2606:2800:220:1:248:1893:25c8:1946\n", target)
+	case "MX":
+		sbprintf(&b, "%s.\t\t300\tIN\tMX\t10 mail.%s.\n", target, target)
+	case "TXT":
+		sbprintf(&b, "%s.\t\t300\tIN\tTXT\t\"v=spf1 include:_spf.%s ~all\"\n", target, target)
+	case "NS":
+		sbprintf(&b, "%s.\t\t300\tIN\tNS\tns1.%s.\n", target, target)
+		sbprintf(&b, "%s.\t\t300\tIN\tNS\tns2.%s.\n", target, target)
+	case "CNAME":
+		sbprintf(&b, "www.%s.\t300\tIN\tCNAME\t%s.\n", target, target)
+	case "SOA":
+		sbprintf(&b, "%s.\t\t300\tIN\tSOA\tns1.%s. hostmaster.%s. 2026082101 7200 3600 1209600 86400\n", target, target, target)
+	case "PTR":
+		sbprintf(&b, "34.216.184.93.in-addr.arpa.\t300\tIN\tPTR\t%s.\n", target)
+	case "SRV":
+		sbprintf(&b, "_sip._tcp.%s.\t300\tIN\tSRV\t10 60 5060 sip.%s.\n", target, target)
+	default: // A / ANY
+		sbprintf(&b, "%s.\t\t300\tIN\tA\t93.184.216.34\n", target)
+	}
+	sbprintf(&b, "\n;; Query time: %d msec\n", rand.IntN(40)+5)
+	sbprintf(&b, ";; SERVER: 127.0.0.53#53(127.0.0.53) (UDP)\n")
+	sbprintf(&b, ";; WHEN: %s\n", time.Now().Format("Mon Jan 02 15:04:05 MST 2006"))
+	sbprintf(&b, ";; MSG SIZE  rcvd: %d\n", rand.IntN(80)+45)
+	return []byte(b.String())
 }
 
 func (v *VNet) ssh(args []string) []byte {

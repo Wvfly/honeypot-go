@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -545,16 +546,192 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 	defer idle.Stop()
 
 	line := make([]byte, 0, 256)
+	cursor := 0    // 光标位于 line[:cursor] 与 line[cursor:] 之间
+	histIdx := -1  // -1 = 未在历史导航中
+	var esc []byte // ANSI 转义序列缓冲
+
+	// redraw 重绘整行（清除 → 输出 → 光标回退），行内编辑统一走此函数保证终端与录制一致
+	redraw := func() {
+		_, _ = ch.Write([]byte("\r\x1b[K"))
+		sess.RecordOutput([]byte("\r\x1b[K"))
+		if len(line) > 0 {
+			_, _ = ch.Write(line)
+			sess.RecordOutput(line)
+		}
+		if n := len(line) - cursor; n > 0 {
+			mv := []byte(fmt.Sprintf("\x1b[%dD", n))
+			_, _ = ch.Write(mv)
+			sess.RecordOutput(mv)
+		}
+	}
+
+	// insertAt 在光标处插入字节（行尾直接追加；行中需重绘）
+	insertAt := func(b byte) {
+		if len(line) >= maxInteractiveLine {
+			return
+		}
+		if cursor == len(line) {
+			line = append(line, b)
+			_, _ = ch.Write([]byte{b})
+			sess.RecordOutput([]byte{b})
+			return
+		}
+		line = append(line, 0)
+		copy(line[cursor+1:], line[cursor:])
+		line[cursor] = b
+		cursor++
+		redraw()
+	}
+
+	backspace := func() { // Backspace：删除光标前一字符
+		if cursor <= 0 {
+			return
+		}
+		copy(line[cursor-1:], line[cursor:])
+		line = line[:len(line)-1]
+		cursor--
+		redraw()
+	}
+
+	del := func() { // Del：删除光标处字符
+		if cursor >= len(line) {
+			return
+		}
+		copy(line[cursor:], line[cursor+1:])
+		line = line[:len(line)-1]
+		redraw()
+	}
+
+	// navHistory 上下键历史导航
+	navHistory := func(up bool) {
+		hist := sess.History()
+		if up {
+			if len(hist) == 0 {
+				return
+			}
+			if histIdx < len(hist)-1 {
+				histIdx++
+			}
+			line = append(line[:0], hist[len(hist)-1-histIdx]...)
+		} else {
+			if histIdx <= 0 {
+				histIdx = -1
+				line = line[:0]
+				redraw()
+				return
+			}
+			histIdx--
+			line = append(line[:0], hist[len(hist)-1-histIdx]...)
+		}
+		cursor = len(line)
+		redraw()
+	}
+
+	// complete Tab 路径补全（仅支持行尾补全；多个候选时列出）
+	complete := func() {
+		if cursor != len(line) {
+			return
+		}
+		tok := string(line)
+		if i := strings.LastIndexAny(tok, " \t;|&"); i >= 0 {
+			tok = tok[i+1:]
+		}
+		if tok == "" {
+			_, _ = ch.Write([]byte{'\x07'})
+			sess.RecordOutput([]byte{'\x07'})
+			return
+		}
+		cands := sess.Complete(tok)
+		switch len(cands) {
+		case 0:
+			_, _ = ch.Write([]byte{'\x07'})
+			sess.RecordOutput([]byte{'\x07'})
+		case 1:
+			suffix := cands[0][len(tok):]
+			line = append(line, suffix...)
+			cursor = len(line)
+			_, _ = ch.Write([]byte(suffix))
+			sess.RecordOutput([]byte(suffix))
+		default:
+			_, _ = ch.Write([]byte("\r\n"))
+			sess.RecordOutput([]byte("\r\n"))
+			for _, c := range cands {
+				_, _ = ch.Write([]byte(c + "  "))
+				sess.RecordOutput([]byte(c + "  "))
+			}
+			_, _ = ch.Write([]byte("\r\n"))
+			sess.RecordOutput([]byte("\r\n"))
+			redraw()
+		}
+	}
+
+	// handleEsc 处理 ANSI 控制序列（CSI）：方向键 / Home / End / Del
+	handleEsc := func(seq []byte) {
+		switch string(seq) {
+		case "\x1b[A": // ↑
+			navHistory(true)
+		case "\x1b[B": // ↓
+			navHistory(false)
+		case "\x1b[C": // →
+			if cursor < len(line) {
+				cursor++
+				_, _ = ch.Write([]byte("\x1b[C"))
+				sess.RecordOutput([]byte("\x1b[C"))
+			}
+		case "\x1b[D": // ←
+			if cursor > 0 {
+				cursor--
+				_, _ = ch.Write([]byte("\x1b[D"))
+				sess.RecordOutput([]byte("\x1b[D"))
+			}
+		case "\x1b[H", "\x1b[1~": // Home
+			if cursor > 0 {
+				cursor = 0
+				_, _ = ch.Write([]byte("\x1b[H"))
+				sess.RecordOutput([]byte("\x1b[H"))
+			}
+		case "\x1b[F", "\x1b[4~": // End
+			if cursor < len(line) {
+				cursor = len(line)
+				_, _ = ch.Write([]byte("\x1b[F"))
+				sess.RecordOutput([]byte("\x1b[F"))
+			}
+		case "\x1b[3~": // Del
+			del()
+		}
+	}
+
+	// maxEscLen 转义序列最大长度：防恶意客户端持续发送无终止 ESC 序列造成内存积累
+	const maxEscLen = 16
+
 	process := func(data []byte) bool {
 		refresh() // 有输入活动，刷新连接级 idle
 		sess.RecordInput(data)
-		for _, b := range data {
+		for i := 0; i < len(data); i++ {
+			b := data[i]
+			if len(esc) > 0 {
+				// 已在转义序列中：收集到 CSI 终止字节（0x40~0x7E）
+				if len(esc) >= maxEscLen {
+					esc = esc[:0]
+					continue
+				}
+				esc = append(esc, b)
+				if b >= 0x40 && b <= 0x7E {
+					handleEsc(esc)
+					esc = esc[:0]
+				}
+				continue
+			}
 			switch b {
+			case 0x1b:
+				esc = append(esc, b)
 			case '\r', '\n':
 				_, _ = ch.Write([]byte("\r\n"))
 				sess.RecordOutput([]byte("\r\n"))
 				cmd := string(line)
 				line = line[:0]
+				cursor = 0
+				histIdx = -1
 				if cmd == "exit" || cmd == "logout" {
 					return false
 				}
@@ -570,6 +747,8 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 
 			case 0x03: // Ctrl-C
 				line = line[:0]
+				cursor = 0
+				histIdx = -1
 				_, _ = ch.Write([]byte("^C\r\n"))
 				sess.RecordOutput([]byte("^C\r\n"))
 				_, _ = ch.Write([]byte(sess.Prompt()))
@@ -580,20 +759,14 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 				return false
 
 			case 0x7f, 0x08: // Backspace
-				if len(line) > 0 {
-					line = line[:len(line)-1]
-					_, _ = ch.Write([]byte("\b \b"))
-					sess.RecordOutput([]byte("\b \b"))
-				}
+				backspace()
+
+			case '\t': // Tab 补全
+				complete()
 
 			default:
-				if b >= 0x20 || b == '\t' {
-					// 超长行截断，防止无回车粘贴无限增长占用内存
-					if len(line) < maxInteractiveLine {
-						line = append(line, b)
-						_, _ = ch.Write([]byte{b})
-						sess.RecordOutput([]byte{b})
-					}
+				if b >= 0x20 {
+					insertAt(b)
 				}
 			}
 		}

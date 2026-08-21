@@ -1,12 +1,16 @@
 package shell
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"sort"
+	"strconv"
 	"strings"
 
 	"mvdan.cc/sh/v3/expand"
@@ -116,7 +120,7 @@ func (e *Executor) runPipeChain(ctx *execCtx, cwd string, stmts []*syntax.Stmt, 
 		bin := stripPath(args[0])
 		if i > 0 && isFilter(bin) {
 			// 下游过滤命令：处理上游输出
-			buf = e.runFilter(bin, args[1:], buf)
+			buf = e.runFilter(cwd, bin, args[1:], buf)
 			continue
 		}
 		// 首段或非过滤段：正常执行
@@ -169,14 +173,28 @@ func (e *Executor) expandConfig(ctx *execCtx, cwd string) *expand.Config {
 	return &expand.Config{
 		Env: expand.FuncEnviron(func(name string) string {
 			switch name {
-			case "HOME", "PWD":
+			case "HOME": // 仿真 root 登录：家目录固定 /root，而非当前目录
+				return "/root"
+			case "PWD":
 				return cwd
-			case "USER":
+			case "USER", "LOGNAME":
 				return "root"
 			case "SHELL":
 				return "/bin/bash"
 			case "HOSTNAME":
 				return e.hostname
+			case "PATH":
+				return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+			case "LANG":
+				return "en_US.UTF-8"
+			case "TERM":
+				return "xterm-256color"
+			case "?": // 上一条命令退出码
+				return strconv.Itoa(ctx.lastCode)
+			case "$": // shell PID
+				return ctx.pid
+			case "#": // 位置参数个数
+				return "0"
 			}
 			return "" // 空串视为未设置
 		}),
@@ -234,14 +252,15 @@ func (e *Executor) publishFileWritten(ctx *execCtx, path string, data []byte) {
 // isFilter 是否为管道过滤命令
 func isFilter(bin string) bool {
 	switch bin {
-	case "grep", "egrep", "fgrep", "head", "tail", "wc", "sort", "uniq", "cat":
+	case "grep", "egrep", "fgrep", "head", "tail", "wc", "sort", "uniq", "cat",
+		"awk", "sed", "cut", "tr", "base64", "strings", "tee", "xargs", "sha256sum", "md5sum":
 		return true
 	}
 	return false
 }
 
-// runFilter 对输入应用过滤命令
-func (e *Executor) runFilter(bin string, args []string, input []byte) []byte {
+// runFilter 对输入应用过滤命令；cwd 供 tee 等写文件命令使用
+func (e *Executor) runFilter(cwd, bin string, args []string, input []byte) []byte {
 	lines := strings.Split(strings.TrimRight(string(input), "\n"), "\n")
 	if len(input) == 0 || (len(lines) == 1 && lines[0] == "") {
 		lines = nil
@@ -357,8 +376,210 @@ func (e *Executor) runFilter(bin string, args []string, input []byte) []byte {
 		if len(args) == 0 {
 			return input
 		}
+
+	case "cut":
+		delim := "\t"
+		var fields []int
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			if a == "-d" && i+1 < len(args) {
+				i++
+				delim = args[i]
+			} else if a == "-f" && i+1 < len(args) {
+				i++
+				for _, fs := range strings.Split(args[i], ",") {
+					if f := atoi(fs); f > 0 {
+						fields = append(fields, f)
+					}
+				}
+			}
+		}
+		var cut []string
+		for _, l := range lines {
+			parts := strings.Split(l, delim)
+			var picked []string
+			for _, f := range fields {
+				if f-1 < len(parts) {
+					picked = append(picked, parts[f-1])
+				}
+			}
+			if len(picked) == 0 {
+				continue
+			}
+			cut = append(cut, strings.Join(picked, delim))
+		}
+		return []byte(strings.Join(cut, "\n") + maybeNL(cut))
+
+	case "tr":
+		set1, set2 := "", ""
+		deleteMode := false
+		for _, a := range args {
+			switch {
+			case a == "-d" || a == "--delete":
+				deleteMode = true
+			case strings.HasPrefix(a, "-"):
+			case set1 == "":
+				set1 = a
+			case set2 == "":
+				set2 = a
+			}
+		}
+		var trOut []string
+		for _, l := range lines {
+			var b strings.Builder
+			for _, r := range l {
+				if deleteMode {
+					if !strings.ContainsRune(set1, r) {
+						b.WriteRune(r)
+					}
+					continue
+				}
+				if i := strings.IndexRune(set1, r); i >= 0 && i < len(set2) {
+					b.WriteRune(rune(set2[i]))
+				} else {
+					b.WriteRune(r)
+				}
+			}
+			trOut = append(trOut, b.String())
+		}
+		return []byte(strings.Join(trOut, "\n") + maybeNL(trOut))
+
+	case "sed":
+		for _, a := range args {
+			if strings.HasPrefix(a, "s/") {
+				rest := a[2:]
+				parts := strings.SplitN(rest, "/", 3)
+				if len(parts) >= 2 {
+					old, rep := parts[0], parts[1]
+					global := len(parts) > 2 && parts[2] == "g"
+					var sedOut []string
+					for _, l := range lines {
+						if global {
+							sedOut = append(sedOut, strings.ReplaceAll(l, old, rep))
+						} else {
+							sedOut = append(sedOut, strings.Replace(l, old, rep, 1))
+						}
+					}
+					return []byte(strings.Join(sedOut, "\n") + maybeNL(sedOut))
+				}
+			}
+		}
+		return input
+
+	case "awk":
+		delim := " "
+		program := ""
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			switch {
+			case a == "-F" && i+1 < len(args):
+				i++
+				delim = args[i]
+			case strings.HasPrefix(a, "-F") && len(a) > 2:
+				delim = a[2:]
+			case strings.HasPrefix(a, "{"):
+				program = a
+			}
+		}
+		var awkOut []string
+		for _, l := range lines {
+			parts := strings.Split(l, delim)
+			if strings.Contains(program, "$NF") {
+				if len(parts) > 0 {
+					awkOut = append(awkOut, parts[len(parts)-1])
+				}
+				continue
+			}
+			var picked []string
+			for _, f := range strings.Fields(strings.Trim(program, "{} ")) {
+				if strings.HasPrefix(f, "$") && len(f) > 1 {
+					idx := atoi(f[1:])
+					if idx > 0 && idx <= len(parts) {
+						picked = append(picked, parts[idx-1])
+					}
+				}
+			}
+			if len(picked) > 0 {
+				awkOut = append(awkOut, strings.Join(picked, " "))
+			}
+		}
+		return []byte(strings.Join(awkOut, "\n") + maybeNL(awkOut))
+
+	case "base64":
+		decode := false
+		for _, a := range args {
+			if a == "-d" || a == "--decode" || a == "-D" {
+				decode = true
+			}
+		}
+		data := strings.TrimRight(string(input), "\n")
+		if decode {
+			raw, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return input
+			}
+			return raw
+		}
+		return []byte(base64.StdEncoding.EncodeToString(input) + "\n")
+
+	case "sha256sum", "md5sum":
+		h := hashForBin(bin)
+		h.Write(input)
+		return []byte(fmt.Sprintf("%x  -\n", h.Sum(nil)))
+
+	case "strings":
+		// 简化：仅保留可打印 ASCII 行（长度 >= 4）
+		var strOut []string
+		for _, l := range lines {
+			if l == "" {
+				continue
+			}
+			clean := printableOnly(l)
+			if len(clean) >= 4 {
+				strOut = append(strOut, clean)
+			}
+		}
+		return []byte(strings.Join(strOut, "\n") + maybeNL(strOut))
+
+	case "tee":
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			full := a
+			if !strings.HasPrefix(full, "/") {
+				full = joinPath(cwd, full)
+			}
+			_ = e.fs.WriteFile(full, input)
+		}
+		return input
+
+	case "xargs":
+		// 简化：无参数 xargs 直接回显输入（echo 语义）
+		return input
 	}
 	return input
+}
+
+// hashForBin 返回 sha256sum/md5sum 对应的 hash.Hash
+func hashForBin(bin string) hash.Hash {
+	if bin == "md5sum" {
+		return md5.New()
+	}
+	return sha256.New()
+}
+
+// printableOnly 保留可打印 ASCII 与换行，用于 strings 命令仿真
+func printableOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 0x20 && r <= 0x7e {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // stripPath 去掉命令的路径前缀（/bin/ls → ls）
@@ -388,7 +609,7 @@ func (e *Executor) filterCmd(cwd, bin string, args []string) []byte {
 			data = append(data, b...)
 		}
 	}
-	return e.runFilter(bin, args, data)
+	return e.runFilter(cwd, bin, args, data)
 }
 
 // --- 辅助函数 ---

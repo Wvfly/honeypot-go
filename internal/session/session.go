@@ -2,6 +2,7 @@ package session
 
 import (
 	"log/slog"
+	"path"
 	"strings"
 	"time"
 
@@ -103,7 +104,48 @@ func (s *Session) ExecuteLine(raw string) []byte {
 	}
 	newCwd, res := s.exec.Execute(s.ID, s.cwd, raw)
 	s.cwd = newCwd
+	// 实时追加命令历史（↑/↓ 可回看，history 命令可查看）
+	s.exec.AddHistory(s.ID, raw)
 	return res.Output
+}
+
+// History 返回本会话命令历史
+func (s *Session) History() []string { return s.exec.History(s.ID) }
+
+// Complete 返回给定前缀（相对 cwd 或绝对路径）下的补全候选。
+// 候选上限 24 个，防止超大目录下无界输出。
+func (s *Session) Complete(prefix string) []string {
+	var dir, base string
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
+		dir, base = prefix[:i+1], prefix[i+1:]
+	} else {
+		base = prefix
+	}
+	dirPath := dir
+	if !strings.HasPrefix(dirPath, "/") {
+		dirPath = path.Clean(s.cwd + "/" + dirPath)
+	} else {
+		dirPath = path.Clean(dirPath)
+	}
+	infos, err := s.fs.List(dirPath)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, 24)
+	for _, in := range infos {
+		if !strings.HasPrefix(in.Name, base) {
+			continue
+		}
+		name := in.Name
+		if in.IsDir {
+			name += "/"
+		}
+		out = append(out, dir+name)
+		if len(out) >= 24 {
+			break
+		}
+	}
+	return out
 }
 
 // Close 发布会话关闭事件
@@ -117,6 +159,8 @@ func (s *Session) Close() {
 		"session_id":    s.ID,
 		"duration_ms":   time.Since(s.started).Milliseconds(),
 	}))
+	// 清理会话级命令状态，防长期运行内存泄漏
+	s.exec.RemoveSession(s.ID)
 }
 
 func (s *Session) fsHostname() string {
