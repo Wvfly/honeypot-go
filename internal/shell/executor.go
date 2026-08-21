@@ -157,6 +157,16 @@ func limitOutput(out []byte) []byte {
 	return truncated
 }
 
+// capOut 中间输出软上限：多命令串联（; && || |）时 out 会逐段累积传给下一条命令，
+// 若不截断，N 段命令可把 out 撑到 N×8MiB 才在最外层 limitOutput 截断，造成内存放大。
+// 语义与 limitOutput 一致（保留前缀），但不追加提示（最外层统一加），且仅在超限时复制。
+func capOut(out []byte) []byte {
+	if len(out) <= maxOutputSize {
+		return out
+	}
+	return out[:maxOutputSize]
+}
+
 // simDelay 仿真命令执行耗时：按命令类别给毫秒级随机延迟。
 // 上限固定（重命令 250ms / 常规 80ms / 轻命令 25ms），防大量命令导致 CPU 与交互排队膨胀。
 func simDelay(bin string) {
@@ -179,7 +189,13 @@ func simDelay(bin string) {
 // Execute 执行一段命令串（可含 ; && || | $()），返回最终 exit code 与合并输出。
 // 返回执行后的新 cwd（支持 cd 状态变更）。
 func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
-	ctx := &execCtx{sessionID: sessionID, pid: sessionPid(sessionID)}
+	return e.executeDepth(sessionID, cwd, raw, 0)
+}
+
+// executeDepth 带嵌套深度的执行入口：sudo 等内部重入通过 depth 复用
+// maxCmdSubstDepth 上限，防止 sudo sudo ... 无限递归耗尽栈与 CPU。
+func (e *Executor) executeDepth(sessionID, cwd, raw string, depth int) (string, Result) {
+	ctx := &execCtx{sessionID: sessionID, pid: sessionPid(sessionID), depth: depth}
 	e.setCWD(sessionID, cwd)
 
 	start := time.Now()
@@ -232,6 +248,7 @@ func (e *Executor) runSequence(ctx *execCtx, cwd, raw string) (string, int, []by
 			continue
 		}
 		cwd, code, out = e.runAndOr(ctx, cwd, seg, out)
+		out = capOut(out) // 中间软上限：防多段命令 out 无限累积放大内存
 	}
 	return cwd, code, out
 }
@@ -249,6 +266,7 @@ func (e *Executor) runAndOr(ctx *execCtx, cwd, seg string, out []byte) (string, 
 		}
 		var c int
 		cwd, c, out = e.execPipeline(ctx, cwd, cmd, out)
+		out = capOut(out) // 中间软上限：防 &&/|| 链 out 无限累积放大内存
 		if t.op == "&&" && c != 0 {
 			return cwd, c, out
 		}
@@ -721,13 +739,41 @@ User root may run the following commands on %s:
 	if args[0] == "-i" || args[0] == "-s" || args[0] == "-u" {
 		return nil
 	}
-	// sudo <cmd>：剥离 sudo 前缀递归执行
-	sub := strings.TrimSpace(strings.Join(args, " "))
+	// sudo <cmd>：一次性剥离所有连续 sudo 前缀（sudo sudo ls -> ls），
+	// 避免逐层递归；深度超过 maxCmdSubstDepth 直接拒绝，防 sudo sudo ... 无限嵌套 DoS。
+	sub := stripLeadingSudo(strings.TrimSpace(strings.Join(args, " ")))
 	if sub == "" {
 		return nil
 	}
-	_, res := e.Execute(ctx.sessionID, cwd, sub)
+	if ctx.depth >= maxCmdSubstDepth {
+		return []byte("sudo: too many levels of nested sudo\n")
+	}
+	_, res := e.executeDepth(ctx.sessionID, cwd, sub, ctx.depth+1)
 	return res.Output
+}
+
+// stripLeadingSudo 去掉命令串开头所有连续的 "sudo" 前缀（含空白）。
+// "sudo sudo ls" -> "ls"；"sudo -l" -> "sudo -l"（保留 sudo 选项给递归处理）。
+func stripLeadingSudo(s string) string {
+	for {
+		t := strings.TrimSpace(s)
+		if t == "sudo" {
+			return ""
+		}
+		// 必须是独立单词 "sudo " 开头（后随空白），避免误剥 "sudosomething"
+		if !strings.HasPrefix(t, "sudo ") {
+			return t
+		}
+		rest := strings.TrimSpace(t[len("sudo "):])
+		if rest == "" {
+			return ""
+		}
+		// 下一个 token 是 sudo 选项（-...）时停止剥离，交给递归执行处理
+		if strings.HasPrefix(rest, "-") {
+			return t
+		}
+		s = rest
+	}
 }
 
 // findCmd 仿真 find：支持 -name（通配符）/ -type / -maxdepth

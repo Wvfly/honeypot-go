@@ -26,11 +26,22 @@ type node struct {
 	children map[string]*node
 }
 
+// 全局容量预算：防攻击者通过 touch/mkdir/wget/echo 无限创建节点与内容，
+// 导致进程内存无限增长（P0-2）。maxFileSize 是单文件上限，这两个是全局上限。
+const (
+	maxTotalBytes = 2 << 30 // 2 GiB：所有文件内容字节总和
+	maxTotalNodes = 200000  // 20 万：总节点数（含目录）
+)
+
 // FileSystem 内存虚拟文件系统（M1：只读快照 + 基本目录导航）
 type FileSystem struct {
 	mu       sync.RWMutex
 	root     *node
 	hostname string
+
+	// 全局容量计数（仅在持有写锁时修改；读路径只读这些值）
+	totalBytes int64 // 当前所有文件内容字节总和
+	totalNodes int64 // 当前节点总数（含目录）
 }
 
 // New 创建并预置一个逼真的 Linux 根文件系统
@@ -40,7 +51,41 @@ func New(cfg config.VFSConfig) *FileSystem {
 		root:     &node{name: "/", isDir: true, perm: "drwxr-xr-x", owner: "root", group: "root", children: map[string]*node{}},
 	}
 	fs.bootstrap(cfg.Users)
+	fs.recountUsage()
 	return fs
+}
+
+// recountUsage 重新统计全树节点数与内容字节数（bootstrap 后调用一次）。
+// 必须在无锁（构造期）或持有写锁时调用。
+func (fs *FileSystem) recountUsage() {
+	var nodes, bytes int64
+	var walk func(n *node)
+	walk = func(n *node) {
+		nodes++
+		if !n.isDir {
+			bytes += int64(len(n.content))
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(fs.root)
+	fs.totalNodes = nodes
+	fs.totalBytes = bytes
+}
+
+// subtreeStats 递归统计节点 n 的子孙总数与内容字节数（供删除时回退预算）。
+func subtreeStats(n *node) (nodes, bytes int64) {
+	nodes = 1
+	if !n.isDir {
+		bytes = int64(len(n.content))
+	}
+	for _, c := range n.children {
+		cn, cb := subtreeStats(c)
+		nodes += cn
+		bytes += cb
+	}
+	return nodes, bytes
 }
 
 func (fs *FileSystem) addFile(path, perm, owner, group string, content []byte) {
@@ -364,7 +409,8 @@ func (fs *FileSystem) ReadFile(path string) ([]byte, error) {
 	if content := fs.procContent(path); content != nil {
 		return content, nil
 	}
-	return n.content, nil
+	// 返回副本：防止调用方持有 RUnlock 后，与 append 写入路径共享底层数组造成数据竞争
+	return append([]byte(nil), n.content...), nil
 }
 
 // IsDir 判断路径是否为目录
@@ -430,8 +476,13 @@ func (fs *FileSystem) lockedWrite(path string, data []byte, appendMode bool) err
 	}
 	n, exists := dir.children[name]
 	if !exists {
+		// 新建文件：全局节点数预算检查
+		if fs.totalNodes >= maxTotalNodes {
+			return fmt.Errorf("filesystem node limit reached (%d)", maxTotalNodes)
+		}
 		n = &node{name: name, perm: "-rw-r--r--", owner: "root", group: "root", mtime: time.Now()}
 		dir.children[name] = n
+		fs.totalNodes++
 	} else if n.isDir {
 		return fmt.Errorf("is a directory")
 	} else if !permWritable(n.perm) {
@@ -445,6 +496,11 @@ func (fs *FileSystem) lockedWrite(path string, data []byte, appendMode bool) err
 	if newSize > maxFileSize {
 		return fmt.Errorf("file %q exceeds max size %d", path, maxFileSize)
 	}
+	// 全局字节数预算：增量 = 新大小 - 旧大小
+	delta := newSize - int64(len(n.content))
+	if delta > 0 && fs.totalBytes+delta > maxTotalBytes {
+		return fmt.Errorf("filesystem capacity limit reached (%d bytes)", maxTotalBytes)
+	}
 	if appendMode {
 		n.content = append(n.content, data...)
 	} else {
@@ -452,6 +508,7 @@ func (fs *FileSystem) lockedWrite(path string, data []byte, appendMode bool) err
 	}
 	n.size = int64(len(n.content))
 	n.mtime = time.Now()
+	fs.totalBytes += delta
 	return nil
 }
 
@@ -530,8 +587,12 @@ func (fs *FileSystem) Mkdir(p, perm, owner, group string) error {
 		if !permWritable(dir.perm) {
 			return fmt.Errorf("permission denied: directory %q is read-only", dir.name)
 		}
+		if fs.totalNodes >= maxTotalNodes {
+			return fmt.Errorf("filesystem node limit reached (%d)", maxTotalNodes)
+		}
 		d := &node{name: seg, isDir: true, perm: "drwxr-xr-x", owner: "root", group: "root", mtime: time.Now(), children: map[string]*node{}}
 		dir.children[seg] = d
+		fs.totalNodes++
 		stack = append(stack, dir)
 		dir = d
 	}
@@ -561,6 +622,10 @@ func (fs *FileSystem) Remove(p string) error {
 		return fmt.Errorf("permission denied: directory %q is read-only", parent.name)
 	}
 	delete(parent.children, name)
+	if !n.isDir {
+		fs.totalBytes -= int64(len(n.content))
+	}
+	fs.totalNodes--
 	return nil
 }
 
@@ -572,13 +637,17 @@ func (fs *FileSystem) RemoveAll(p string) error {
 	if !ok {
 		return fmt.Errorf("no such file or directory")
 	}
-	if _, exists := parent.children[name]; !exists {
+	n, exists := parent.children[name]
+	if !exists {
 		return fmt.Errorf("no such file or directory")
 	}
 	if !permWritable(parent.perm) {
 		return fmt.Errorf("permission denied: directory %q is read-only", parent.name)
 	}
+	nodes, bytes := subtreeStats(n)
 	delete(parent.children, name)
+	fs.totalNodes -= nodes
+	fs.totalBytes -= bytes
 	return nil
 }
 
@@ -628,6 +697,15 @@ func (fs *FileSystem) Copy(srcPath, dstPath string) error {
 	if _, exists := dstParent.children[dstName]; exists {
 		return fmt.Errorf("cannot overwrite existing file")
 	}
+	if src.size > maxFileSize {
+		return fmt.Errorf("file %q exceeds max size %d", srcPath, maxFileSize)
+	}
+	if fs.totalNodes >= maxTotalNodes {
+		return fmt.Errorf("filesystem node limit reached (%d)", maxTotalNodes)
+	}
+	if fs.totalBytes+src.size > maxTotalBytes {
+		return fmt.Errorf("filesystem capacity limit reached (%d bytes)", maxTotalBytes)
+	}
 	cp := &node{
 		name:    dstName,
 		perm:    src.perm,
@@ -638,6 +716,8 @@ func (fs *FileSystem) Copy(srcPath, dstPath string) error {
 		content: append([]byte(nil), src.content...),
 	}
 	dstParent.children[dstName] = cp
+	fs.totalNodes++
+	fs.totalBytes += src.size
 	return nil
 }
 
@@ -692,6 +772,8 @@ const maxWalkNodes = 20000
 
 // Walk 先序遍历以 root 为根的子树（不含 root 自身），对每个节点调用 fn(relPath, FileInfo)。
 // relPath 为相对 root 的路径；fn 返回 false 终止遍历。返回遍历是否被提前终止。
+// 注意：fn 在持有 RLock 期间被调用，回调内严禁调用任何写方法（WriteFile/Mkdir/Remove 等），
+// 否则 RLock→Lock 升级会死锁；只读 fs.FileInfo 是安全的。
 func (fs *FileSystem) Walk(root string, fn func(string, FileInfo) bool) bool {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()

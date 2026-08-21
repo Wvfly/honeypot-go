@@ -34,6 +34,7 @@ func (e *Executor) runAST(ctx *execCtx, cwd, raw string) (string, int, []byte, b
 	for _, stmt := range f.Stmts {
 		var c int
 		cwd, c, out = e.runStmt(ctx, cwd, stmt, out)
+		out = capOut(out) // 中间软上限：防多语句命令串 out 无限累积放大内存
 		code = c
 	}
 	return cwd, code, out, true
@@ -127,6 +128,7 @@ func (e *Executor) runPipeChain(ctx *execCtx, cwd string, stmts []*syntax.Stmt, 
 		cwd, code, buf = e.runCall(ctx, cwd, call, s.Redirs, buf)
 	}
 	out = append(out, buf...)
+	out = capOut(out) // 中间软上限：防管道链输出累积放大内存
 	return cwd, code, out
 }
 
