@@ -457,10 +457,62 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		return cwd, 0, append(out, e.statCmd(cwd, rest)...)
 	case "du":
 		return cwd, 0, append(out, e.duCmd(cwd, rest)...)
+	// 常用脚本解释器：sh/bash/python/perl 等。攻击者常用 -c/-e 内联代码执行
+	// 反弹 shell 或下载载荷。蜜罐不真实执行，但需"假装成功"（exit 0，无输出），
+	// 并将内联代码递归执行一次，使 wget/curl/重定向等副作用落入 VFS 与 vnet 检测。
+	case "sh", "bash", "dash", "ash", "ksh", "zsh":
+		nc, c, o := e.runInterpreter(ctx, cwd, bin, rest, out)
+		return nc, c, o
+	case "python", "python3", "python2", "perl", "php", "ruby", "lua", "node":
+		nc, c, o := e.runInterpreter(ctx, cwd, bin, rest, out)
+		return nc, c, o
 	default:
 		out = append(out, []byte("bash: "+args[0]+": command not found\n")...)
 		return cwd, 127, out
 	}
+}
+
+// runInterpreter 仿真解释器执行：提取 -c/-e 内联代码并递归执行一次（使副作用落入
+// VFS/vnet 检测），但丢弃其输出与 cwd 变更（解释器子进程不影响父 shell）。
+// 无内联代码（交互模式/脚本文件路径）时静默成功。嵌套超限时返回错误提示，防递归 DoS。
+func (e *Executor) runInterpreter(ctx *execCtx, cwd, bin string, args []string, out []byte) (string, int, []byte) {
+	code := interpreterCode(args)
+	if code == "" {
+		return cwd, 0, out
+	}
+	if ctx.depth >= maxCmdSubstDepth {
+		return cwd, 1, append(out, []byte(bin+": too many nested interpreter levels\n")...)
+	}
+	_, _ = e.executeDepth(ctx.sessionID, cwd, code, ctx.depth+1)
+	return cwd, 0, out
+}
+
+// interpreterCode 提取解释器内联代码：
+//
+//	-c <code>（sh/bash/python）、-e/-E <code>（perl/ruby）及 -cxxx 连写形式。
+//
+// 首个非选项参数（脚本文件路径）或无可提取代码时返回 ""，调用方静默成功。
+func interpreterCode(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-c" || a == "-e" || a == "-E":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		case strings.HasPrefix(a, "-c") && len(a) > 2:
+			return a[2:]
+		case strings.HasPrefix(a, "-e") && len(a) > 2:
+			return a[2:]
+		case strings.HasPrefix(a, "-"):
+			continue
+		default:
+			// 首个非选项参数是脚本文件路径：无内联代码
+			return ""
+		}
+	}
+	return ""
 }
 
 func (e *Executor) uname(args []string) []byte {
