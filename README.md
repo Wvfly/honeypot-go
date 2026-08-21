@@ -151,8 +151,8 @@ data/
 | 工具 | 用途 | 用法 |
 |---|---|---|
 | `cmd/dbquery` | 打印全部 5 张表（连接/爆破/会话/命令/扩展事件） | `go run ./cmd/dbquery` |
-| `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本 | `go run ./cmd/ttyshow data\recordings\*.ttyrec` |
-| SQLite 关联查询 | 按 IP 关联攻击者全部行为 | `sqlite3 data\honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
+| `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本 | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
+| SQLite 关联查询 | 按 IP 关联攻击者全部行为 | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
 > `auth_attempts` 记录每次爆破的**密码原文**；`commands` 记录每条命令的 exit code / 耗时 / 输出摘要；`events` 通用表承载扩展事件（下载/连接/文件写入/告警），payload 为 JSON。
 

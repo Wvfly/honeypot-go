@@ -1,5 +1,11 @@
 # honeypot-go
 
+![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)
+![Status](https://img.shields.io/badge/Status-M2%20Release-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-4EAA25)
+![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+[中文文档](README.md) | [English](README.en.md)
+
 A high-interaction SSH honeypot framework written in Go. It lures, records, and analyzes an attacker's full kill chain — **scan → brute force → login → recon → payload delivery → lateral movement** — at minimal real-world risk.
 
 Every command, file, and network behavior is **emulated in user space**, so the honeypot itself can never be "compromised". Outbound traffic is disabled by default, so it cannot be abused as a pivot.
@@ -62,7 +68,7 @@ You will land in the emulated shell. Run any command to observe the output, then
 go run ./cmd/dbquery        # inspect all captured attack events
 ```
 
-### Sample session
+### Sample session (smoke-test output)
 
 ```
 $ ssh -p 2222 root@127.0.0.1
@@ -77,6 +83,16 @@ www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
 root@ubuntu-web-01:~# cat /etc/shadow
 root:$6$rounds=656000$ZyHdQ8m4tZ8mK0n$...:19800:0:99999:7:::
 root@ubuntu-web-01:~# exit
+```
+
+Captured events:
+
+```
+== auth_attempts ==
+  conn_xxx | 2026-08-20T... | user=root pass=123456 method=password success=1 delay=512ms
+== commands ==
+  sess_xxx | 2026-08-20T... | cwd=/root | code=0 dur=12ms | whoami
+  sess_xxx | 2026-08-20T... | cwd=/root | code=0 dur=15ms | uname -a
 ```
 
 ---
