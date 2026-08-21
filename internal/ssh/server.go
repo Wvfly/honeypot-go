@@ -572,6 +572,8 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 		}
 		if cursor == len(line) {
 			line = append(line, b)
+			cursor++ // 行尾追加必须递增光标，否则下一次 insertAt 落进 else 分支、错误触发整行 redraw，
+			// 在终端上表现为"敲一个字符就闪一次重画"
 			_, _ = ch.Write([]byte{b})
 			sess.RecordOutput([]byte{b})
 			return
