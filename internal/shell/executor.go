@@ -175,7 +175,7 @@ func simDelay(bin string) {
 	case "find", "du", "grep", "egrep", "fgrep", "awk", "sed", "sort",
 		"tar", "gzip", "gunzip", "apt", "apt-get", "yum", "dnf", "make":
 		maxMs = 250
-	case "cat", "head", "tail", "wc", "file", "stat", "ps", "free", "df",
+	case "cat", "head", "tail", "wc", "file", "stat", "ps", "top", "free", "df",
 		"mount", "ifconfig", "ip", "route", "netstat", "ss", "wget", "curl",
 		"traceroute", "ping", "dig", "nslookup", "host", "python", "python3",
 		"perl", "php", "ruby", "java", "git", "ssh", "scp", "rsync":
@@ -379,6 +379,8 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		return cwd, 0, append(out, e.ps(rest)...)
 	case "who":
 		return cwd, 0, append(out, []byte("root     pts/0        "+time.Now().Format("2006-01-02 15:04")+" (10.0.2.15)\n")...)
+	case "top":
+		return cwd, 0, append(out, e.topCmd()...)
 	case "clear":
 		return cwd, 0, append(out, []byte("\x1b[H\x1b[2J")...)
 	case "history":
@@ -457,6 +459,22 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		return cwd, 0, append(out, e.statCmd(cwd, rest)...)
 	case "du":
 		return cwd, 0, append(out, e.duCmd(cwd, rest)...)
+	case "tar":
+		return cwd, 0, append(out, e.tarCmd(cwd, rest)...)
+	case "gzip":
+		return cwd, 0, append(out, e.gzipCmd(cwd, rest, false)...)
+	case "gunzip":
+		return cwd, 0, append(out, e.gzipCmd(cwd, rest, true)...)
+	case "apt", "apt-get", "yum", "dnf":
+		return cwd, 0, append(out, e.pkgCmd(bin, rest)...)
+	case "make":
+		return cwd, 0, append(out, e.makeCmd(cwd)...)
+	case "git":
+		return cwd, 0, append(out, e.gitCmd(cwd, rest)...)
+	case "java":
+		return cwd, 0, append(out, e.javaCmd(cwd, rest)...)
+	case "rsync":
+		return cwd, 0, append(out, e.rsyncCmd(cwd, rest)...)
 	// 常用脚本解释器：sh/bash/python/perl 等。攻击者常用 -c/-e 内联代码执行
 	// 反弹 shell 或下载载荷。蜜罐不真实执行，但需"假装成功"（exit 0，无输出），
 	// 并将内联代码递归执行一次，使 wget/curl/重定向等副作用落入 VFS 与 vnet 检测。
@@ -728,6 +746,10 @@ var knownPaths = map[string]string{
 	"nano": "/usr/bin/nano", "vim": "/usr/bin/vim", "vi": "/usr/bin/vi", "tmux": "/usr/bin/tmux",
 	"screen": "/usr/bin/screen", "chmod": "/usr/bin/chmod", "chown": "/usr/bin/chown",
 	"base64": "/usr/bin/base64", "tar": "/usr/bin/tar", "apt": "/usr/bin/apt",
+	"apt-get": "/usr/bin/apt-get", "yum": "/usr/bin/yum", "dnf": "/usr/bin/dnf",
+	"gzip": "/bin/gzip", "gunzip": "/bin/gunzip", "make": "/usr/bin/make",
+	"git": "/usr/bin/git", "java": "/usr/bin/java", "rsync": "/usr/bin/rsync",
+	"top": "/usr/bin/top",
 }
 
 // whichCmd 仿真 which：返回命令路径；未找到 exit 1（无输出）
@@ -1220,6 +1242,399 @@ func (e *Executor) duCmd(cwd string, args []string) []byte {
 			fmt.Fprintf(&b, "%d\t%s\n", kb, t)
 		}
 	}
+	return []byte(b.String())
+}
+
+// topCmd 仿真 top：本仿真 shell 没有真实的屏幕刷新循环，无论交互模式还是
+// -bn1 批处理模式，都只输出一次静态快照（与 free/ps 的简化方式一致），
+// 数值与 uptimeCmd/freeText 保持一致，避免同一台"机器"的负载/内存数字互相矛盾。
+func (e *Executor) topCmd() []byte {
+	now := time.Now()
+	return []byte(fmt.Sprintf(`top - %s up 7 days,  1 user,  load average: 0.00, 0.01, 0.05
+Tasks:  92 total,   1 running,  91 sleeping,   0 stopped,   0 zombie
+%%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.3 id,  0.1 wa,  0.0 hi,  0.1 si,  0.0 st
+MiB Mem :  15962.5 total,   8471.0 free,   4460.9 used,   3030.7 buff/cache
+MiB Swap:   2048.0 total,   2048.0 free,      0.0 used.  10377.2 avail Mem
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %%CPU  %%MEM     TIME+ COMMAND
+      1 root      20   0  167020  11976   8564 S   0.0   0.1   0:02.14 systemd
+    378 root      20   0   14100   7168   6144 S   0.0   0.0   0:00.31 sshd
+    402 root      20   0   14232   6720   5760 S   0.0   0.0   0:00.05 sshd
+    403 root      20   0    9124   5340   4544 S   0.0   0.0   0:00.08 bash
+    420 root      20   0    9328   5560   4544 R   0.3   0.0   0:00.01 top
+`, now.Format("15:04:05")))
+}
+
+// stripArchiveExt 去掉常见归档/压缩扩展名，得到 tar 解包后"看起来应该在的"条目名
+// （攻击者的载荷压缩包绝大多数是单文件/单目录，这个近似足够撑住后续 ls/chmod +x）。
+func stripArchiveExt(name string) string {
+	for _, ext := range []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".tar", ".gz", ".bz2", ".xz"} {
+		if strings.HasSuffix(name, ext) {
+			trimmed := strings.TrimSuffix(name, ext)
+			if trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return name
+}
+
+// tarCmd 仿真 tar：支持 -x/-c/-t 三种模式的短选项组合（-xzf/-czvf/-tf 等）与对应
+// 长选项，以及 -C dir、-f/--file FILE。不做真实压缩/解包，只在 VFS 里维持
+// "看起来一致"的状态：create 落地一个占位归档文件；extract 在目标目录下生成一个
+// 以归档名（去掉压缩后缀）命名的条目，供后续 ls/chmod +x/./entry 继续走下去。
+func (e *Executor) tarCmd(cwd string, args []string) []byte {
+	var mode byte
+	var file, changeDir string
+	verbose := false
+	var operands []string
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-f" || a == "--file":
+			if i+1 < len(args) {
+				i++
+				file = args[i]
+			}
+		case strings.HasPrefix(a, "--file="):
+			file = strings.TrimPrefix(a, "--file=")
+		case a == "-C" || a == "--directory":
+			if i+1 < len(args) {
+				i++
+				changeDir = args[i]
+			}
+		case a == "--extract" || a == "--get":
+			mode = 'x'
+		case a == "--create":
+			mode = 'c'
+		case a == "--list":
+			mode = 't'
+		case a == "--verbose":
+			verbose = true
+		case strings.HasPrefix(a, "-") && a != "-":
+			cluster := strings.TrimPrefix(a, "-")
+			hasF := false
+			for _, c := range cluster {
+				switch c {
+				case 'x':
+					mode = 'x'
+				case 'c':
+					mode = 'c'
+				case 't':
+					mode = 't'
+				case 'v':
+					verbose = true
+				case 'f':
+					hasF = true
+				}
+			}
+			if hasF && file == "" && i+1 < len(args) {
+				i++
+				file = args[i]
+			}
+		default:
+			operands = append(operands, a)
+		}
+	}
+	if file == "" && len(operands) > 0 {
+		file = operands[0]
+		operands = operands[1:]
+	}
+	if file == "" || mode == 0 {
+		return []byte("tar: You must specify one of the '-Acdtrux', '--delete' or '--test-label' options\n" +
+			"Try 'tar --help' or 'tar --usage' for more information.\n")
+	}
+
+	archivePath := absPath(cwd, file)
+	destDir := cwd
+	if changeDir != "" {
+		destDir = absPath(cwd, changeDir)
+	}
+
+	switch mode {
+	case 'c':
+		var b strings.Builder
+		if verbose {
+			for _, op := range operands {
+				fmt.Fprintf(&b, "%s\n", op)
+			}
+		}
+		// gzip 魔数开头的占位内容：让后续 file(1) 之类的探测也不至于太离谱
+		placeholder := append([]byte{0x1f, 0x8b, 0x08, 0x00}, []byte("tar-sim-placeholder")...)
+		if err := e.fs.WriteFile(archivePath, placeholder); err != nil {
+			fmt.Fprintf(&b, "tar: %s: %s\n", file, err)
+		}
+		return []byte(b.String())
+	case 't', 'x':
+		if _, ok := e.fs.Resolve(archivePath); !ok {
+			return []byte(fmt.Sprintf("tar (child): %s: Cannot open: No such file or directory\ntar (child): Error is not recoverable: exiting now\n", file))
+		}
+		entry := stripArchiveExt(path.Base(file))
+		if mode == 't' {
+			return []byte(entry + "\n")
+		}
+		target := path.Join(destDir, entry)
+		var b strings.Builder
+		if verbose {
+			fmt.Fprintf(&b, "%s\n", entry)
+		}
+		if err := e.fs.WriteFile(target, []byte{}); err != nil {
+			fmt.Fprintf(&b, "tar: %s: %s\n", entry, err)
+		}
+		return []byte(b.String())
+	default:
+		return []byte("tar: You must specify one of the '-Acdtrux', '--delete' or '--test-label' options\n")
+	}
+}
+
+// gzipCmd 仿真 gzip/gunzip：不做真实压缩算法，只在文件名后缀与存在性上保持
+// 一致（压缩后原文件消失、多出 .gz；解压反向），支持 -k 保留原件、-d 走解压
+// 语义、-c 输出到 stdout 不改动文件。
+func (e *Executor) gzipCmd(cwd string, args []string, decompress bool) []byte {
+	keep := false
+	toStdout := false
+	var targets []string
+	for _, a := range args {
+		switch {
+		case a == "-k" || a == "--keep":
+			keep = true
+		case a == "-c" || a == "--stdout" || a == "--to-stdout":
+			toStdout = true
+		case a == "-d" || a == "--decompress" || a == "--uncompress":
+			decompress = true
+		case strings.HasPrefix(a, "-"):
+			// 忽略压缩等级(-9)等其他选项
+		default:
+			targets = append(targets, a)
+		}
+	}
+	if len(targets) == 0 {
+		return []byte("gzip: compressed data not written to a terminal. Use -f to force compression.\nFor help, type: gzip -h\n")
+	}
+	var b strings.Builder
+	for _, t := range targets {
+		src := absPath(cwd, t)
+		content, err := e.fs.ReadFile(src)
+		if err != nil {
+			fmt.Fprintf(&b, "gzip: %s: No such file or directory\n", t)
+			continue
+		}
+		var dstName string
+		if decompress {
+			dstName = strings.TrimSuffix(t, ".gz")
+			if dstName == t {
+				fmt.Fprintf(&b, "gzip: %s: unknown suffix -- ignored\n", t)
+				continue
+			}
+		} else {
+			dstName = t + ".gz"
+		}
+		if toStdout {
+			b.Write(content)
+			continue
+		}
+		dst := absPath(cwd, dstName)
+		if err := e.fs.WriteFile(dst, content); err != nil {
+			fmt.Fprintf(&b, "gzip: %s\n", err)
+			continue
+		}
+		if !keep {
+			_ = e.fs.Remove(src)
+		}
+	}
+	return []byte(b.String())
+}
+
+// pkgCmd 仿真 apt/apt-get/yum/dnf：不真实安装任何东西，只吐出与真实包管理器
+// 相似的多行日志，让"装 masscan/nmap/screen 等工具"或探测网络出口这类攻击者
+// 常见的收尾动作走完整流程而不是 command not found。
+func (e *Executor) pkgCmd(mgr string, args []string) []byte {
+	var pkgs []string
+	sub := ""
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if sub == "" {
+			sub = a
+			continue
+		}
+		pkgs = append(pkgs, a)
+	}
+	aptLike := mgr == "apt" || mgr == "apt-get"
+	switch sub {
+	case "update", "check-update", "makecache":
+		if aptLike {
+			return []byte("Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease\n" +
+				"Reading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\n" +
+				"All packages are up to date.\n")
+		}
+		return []byte("Loaded plugins: fastestmirror\nLoading mirror speeds from cached hostfile\nNo packages marked for update\n")
+	case "install":
+		if len(pkgs) == 0 {
+			return []byte(mgr + ": missing package name(s)\n")
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Reading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\n"+
+			"The following NEW packages will be installed:\n  %s\n0 upgraded, %d newly installed, 0 to remove and 0 not upgraded.\n",
+			strings.Join(pkgs, " "), len(pkgs))
+		for _, p := range pkgs {
+			fmt.Fprintf(&b, "Setting up %s ...\n", p)
+		}
+		return []byte(b.String())
+	case "remove", "purge", "erase":
+		if len(pkgs) == 0 {
+			return []byte(mgr + ": missing package name(s)\n")
+		}
+		return []byte(fmt.Sprintf("Reading package lists... Done\nThe following packages will be REMOVED:\n  %s\n"+
+			"0 upgraded, 0 newly installed, %d to remove and 0 not upgraded.\n", strings.Join(pkgs, " "), len(pkgs)))
+	case "upgrade", "dist-upgrade":
+		return []byte("Reading package lists... Done\nBuilding dependency tree... Done\nCalculating upgrade... Done\n" +
+			"0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n")
+	case "list":
+		return []byte("Listing... Done\n")
+	case "search":
+		if len(pkgs) == 0 {
+			return nil
+		}
+		return []byte(fmt.Sprintf("Sorting... Done\nFull Text Search... Done\nno packages found matching %s\n", pkgs[0]))
+	case "":
+		return []byte(fmt.Sprintf("%s 2.7.14 (amd64)\nUsage: %s [options] command\n", mgr, mgr))
+	default:
+		return []byte(fmt.Sprintf("E: Invalid operation %s\n", sub))
+	}
+}
+
+// makeCmd 仿真 make：本仿真文件系统里几乎不会有真实 Makefile，绝大多数情况下
+// 和真实 GNU make 一样直接报"没有目标也没有 makefile"。
+func (e *Executor) makeCmd(cwd string) []byte {
+	for _, name := range []string{"Makefile", "makefile", "GNUmakefile"} {
+		if _, err := e.fs.ReadFile(absPath(cwd, name)); err == nil {
+			return []byte("make: Nothing to be done for 'all'.\n")
+		}
+	}
+	return []byte("make: *** No targets specified and no makefile found.  Stop.\n")
+}
+
+// gitCmd 仿真常见 git 子命令：clone 会在 VFS 里真正建出目录，让后续 ls/cd 能
+// 继续走下去；status/log/pull 等在"当前目录不是仓库"这个（对我们的仿真环境
+// 而言几乎总是成立的）默认场景下给出与真实 git 一致的报错。
+func (e *Executor) gitCmd(cwd string, args []string) []byte {
+	if len(args) == 0 {
+		return []byte("usage: git [--version] [--help] <command> [<args>]\n")
+	}
+	sub, rest := args[0], args[1:]
+	const notARepo = "fatal: not a git repository (or any of the parent directories): .git\n"
+	switch sub {
+	case "--version":
+		return []byte("git version 2.43.0\n")
+	case "clone":
+		var url string
+		for _, a := range rest {
+			if !strings.HasPrefix(a, "-") {
+				url = a
+				break
+			}
+		}
+		if url == "" {
+			return []byte("usage: git clone [<options>] [--] <repo> [<dir>]\n")
+		}
+		name := strings.TrimSuffix(path.Base(url), ".git")
+		if name == "" {
+			name = "repo"
+		}
+		dst := path.Join(cwd, name)
+		var b strings.Builder
+		fmt.Fprintf(&b, "Cloning into '%s'...\n", name)
+		if err := e.fs.Mkdir(dst, "drwxr-xr-x", "root", "root"); err != nil {
+			fmt.Fprintf(&b, "fatal: destination path '%s' already exists and is not an empty directory.\n", name)
+			return []byte(b.String())
+		}
+		fmt.Fprintf(&b, "remote: Enumerating objects: 42, done.\n"+
+			"remote: Counting objects: 100%% (42/42), done.\n"+
+			"remote: Compressing objects: 100%% (30/30), done.\n"+
+			"Receiving objects: 100%% (42/42), 18.20 KiB | 2.60 MiB/s, done.\n"+
+			"Resolving deltas: 100%% (12/12), done.\n")
+		return []byte(b.String())
+	case "status", "log", "pull", "fetch", "push", "diff", "branch", "add", "commit":
+		return []byte(notARepo)
+	case "init":
+		return []byte(fmt.Sprintf("Initialized empty Git repository in %s/.git/\n", cwd))
+	default:
+		return []byte(fmt.Sprintf("git: '%s' is not a git command. See 'git --help'.\n", sub))
+	}
+}
+
+// javaCmd 仿真 java：覆盖 -version 与 -jar 两种攻击者最常见的用法
+// （前者是环境探测，后者是运行下载下来的 jar 载荷）。
+func (e *Executor) javaCmd(cwd string, args []string) []byte {
+	if len(args) == 0 {
+		return []byte("Usage: java [options] <mainclass> [args...]\n" +
+			"           (to execute a class)\n" +
+			"   or  java [options] -jar <jarfile> [args...]\n" +
+			"           (to execute a jar file)\n")
+	}
+	for i, a := range args {
+		if a == "-version" || a == "--version" {
+			return []byte("openjdk version \"17.0.9\" 2023-10-17\n" +
+				"OpenJDK Runtime Environment (build 17.0.9+9-Ubuntu-122.04)\n" +
+				"OpenJDK 64-Bit Server VM (build 17.0.9+9-Ubuntu-122.04, mixed mode, sharing)\n")
+		}
+		if a == "-jar" && i+1 < len(args) {
+			jar := args[i+1]
+			if _, err := e.fs.ReadFile(absPath(cwd, jar)); err != nil {
+				return []byte(fmt.Sprintf("Error: Unable to access jarfile %s\n", jar))
+			}
+			return []byte(fmt.Sprintf("Error: Invalid or corrupt jarfile %s\n", jar))
+		}
+	}
+	return []byte(fmt.Sprintf("Error: Could not find or load main class %s\n", args[0]))
+}
+
+// rsyncCmd 仿真 rsync：本地路径之间做一次真实拷贝以保持 VFS 状态一致；
+// 远程形式（user@host:path）只吐出常见的传输摘要文本，不落地任何数据
+// （rsync 尚未接入 vnet 的外联检测，这是已知的后续待办，见 README/架构文档）。
+func (e *Executor) rsyncCmd(cwd string, args []string) []byte {
+	var rest []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+		}
+	}
+	if len(rest) < 2 {
+		return []byte("rsync: missing source/destination\nrsync error: syntax or usage error (code 1)\n")
+	}
+	dst := rest[len(rest)-1]
+	srcs := rest[:len(rest)-1]
+	isRemote := func(p string) bool { return strings.Contains(p, ":") && !strings.HasPrefix(p, "/") }
+
+	var b strings.Builder
+	b.WriteString("sending incremental file list\n")
+	var total int64
+	for _, s := range srcs {
+		if isRemote(s) || isRemote(dst) {
+			fmt.Fprintf(&b, "%s\n", path.Base(strings.TrimPrefix(s, "/")))
+			continue
+		}
+		srcFull := absPath(cwd, s)
+		dstFull := absPath(cwd, dst)
+		target := dstFull
+		if e.fs.IsDir(dstFull) {
+			target = path.Join(dstFull, path.Base(s))
+		}
+		if content, err := e.fs.ReadFile(srcFull); err == nil {
+			_ = e.fs.WriteFile(target, content)
+			total += int64(len(content))
+			fmt.Fprintf(&b, "%s\n", path.Base(s))
+		} else if e.fs.IsDir(srcFull) {
+			fmt.Fprintf(&b, "%s/\n", path.Base(s))
+		} else {
+			fmt.Fprintf(&b, "rsync: change_dir \"%s\" failed: No such file or directory (2)\n", s)
+		}
+	}
+	fmt.Fprintf(&b, "\nsent %d bytes  received 96 bytes  %.2f bytes/sec\ntotal size is %d  speedup is 1.00\n",
+		total+128, float64(total+224), total)
 	return []byte(b.String())
 }
 
