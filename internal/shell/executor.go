@@ -358,6 +358,14 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		return cwd, 0, append(out, e.uname(rest)...)
 	case "ls":
 		return cwd, 0, append(out, e.ls(cwd, rest)...)
+	// ll/la/l 是 Ubuntu/Debian 默认 .bashrc 里带的别名（alias ll='ls -alF' 等），
+	// 登录后极高频出现；本仿真 ls 不支持 -F（类型后缀），忽略即可，不影响可用性。
+	case "ll":
+		return cwd, 0, append(out, e.ls(cwd, append([]string{"-la"}, rest...))...)
+	case "la":
+		return cwd, 0, append(out, e.ls(cwd, append([]string{"-A"}, rest...))...)
+	case "l":
+		return cwd, 0, append(out, e.ls(cwd, rest)...)
 	case "cat":
 		if len(rest) == 0 {
 			return cwd, 1, append(out, []byte("Usage: cat [OPTION]... [FILE]...\n")...)
