@@ -70,17 +70,17 @@ func (s *Session) SetRecorder(rec *tty.Recorder) {
 	s.rec = rec
 }
 
-// RecordInput 录制客户端按键
+// RecordInput 录制客户端按键（原始输入帧，回放时默认不播放，见 tty.Recorder）
 func (s *Session) RecordInput(p []byte) {
 	if s.rec != nil {
-		s.rec.Record(p)
+		s.rec.RecordInput(p)
 	}
 }
 
-// RecordOutput 录制服务端输出
+// RecordOutput 录制服务端输出（攻击者终端上实际会显示的内容）
 func (s *Session) RecordOutput(p []byte) {
 	if s.rec != nil {
-		s.rec.Record(p)
+		s.rec.RecordOutput(p)
 	}
 }
 

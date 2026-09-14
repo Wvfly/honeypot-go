@@ -12,9 +12,11 @@ $env:GOARCH = $Arch
 $env:CGO_ENABLED = "0"
 
 try {
-    go build -trimpath -ldflags "-s -w" -o "honeypot-linux-$Arch" ./cmd/honeypot
+    go build -trimpath -ldflags "-s -w" -o "target/honeypot-linux-$Arch" ./cmd/honeypot
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    go build -trimpath -ldflags "-s -w" -o "ttyshow-linux-$Arch" ./cmd/ttyshow
+    go build -trimpath -ldflags "-s -w" -o "target/ttyshow-linux-$Arch" ./cmd/ttyshow
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    go build -trimpath -ldflags "-s -w" -o "target/dbquery-linux-$Arch" ./cmd/dbquery
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
@@ -25,7 +27,7 @@ finally {
 }
 
 # 校验产物：前 4 字节必须是 ELF 魔数 0x7F 'E' 'L' 'F'
-foreach ($name in @("honeypot-linux-$Arch", "ttyshow-linux-$Arch")) {
+foreach ($name in @("target/honeypot-linux-$Arch", "target/ttyshow-linux-$Arch", "target/dbquery-linux-$Arch")) {
     $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $name))[0..3]
     $isELF = ($bytes[0] -eq 0x7F) -and ($bytes[1] -eq 0x45) -and ($bytes[2] -eq 0x4C) -and ($bytes[3] -eq 0x46)
     if (-not $isELF) {

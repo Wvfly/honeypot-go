@@ -1,0 +1,19 @@
+[Unit]
+Description=SSH Honeypot
+After=network.target
+
+[Service]
+Type=simple
+User=honeypot
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+WorkingDirectory=/opt/honeypot
+ExecStart=/opt/honeypot/bin/honeypot-linux-amd64 -config /opt/honeypot/configs/honeypot.yaml
+Restart=always
+#PrivateTmp=true
+#NoNewPrivileges=true
+#ProtectSystem=strict
+#ReadWritePaths=/opt/honeypot/data /opt/honeypot/logs
+
+[Install]
+WantedBy=multi-user.target
