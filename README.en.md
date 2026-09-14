@@ -319,3 +319,11 @@ See [docs/architecture.md](docs/architecture.md) for the full design (threat mod
 4. **Resource limits**: per-session timeout, max concurrent connections (anti resource-exhaustion)
 5. **Anti-detection**: version fingerprint matches real OpenSSH
 6. **Network isolation**: honeypot network physically/logically separated from production
+
+---
+
+## License
+
+This project is released under the **GNU GPL-3.0** (strong copyleft). Any distribution, modification, or derivative work must also be released under GPL-3.0. The full text is in the `LICENSE` file at the repository root.
+
+> If you modify and distribute this program, you must keep the copyright notice, mark the modification date, and provide the corresponding source. Network-facing deployments are subject to the corresponding AGPL-3.0 terms (contact the maintainer if you intend to switch to AGPL).
