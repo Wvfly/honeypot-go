@@ -158,21 +158,46 @@ data/
 
 ---
 
-## Deploying to Linux
+## Build & Compile
 
-### Cross-compile (produce Linux ELF from Windows)
+The `scripts/` directory provides PowerShell build scripts that set `GOOS/GOARCH/CGO_ENABLED=0` (fully static build) automatically and verify the output binary's magic bytes, so you never ship a binary for the wrong platform.
+
+### Native build (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1              # amd64 (default)
+powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1 -Arch arm64  # ARM64
+```
+
+Outputs go to `target/`:
+
+| Artifact | Description |
+|---|---|
+| `target/honeypot-windows-amd64.exe` | honeypot main binary |
+| `target/ttyshow-windows-amd64.exe` | ttyrec replay |
+| `target/dbquery-windows-amd64.exe` | event query |
+
+The script verifies the first 2 bytes are `MZ` (PE magic).
+
+### Cross-compile (Windows → Linux ELF)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # amd64
-powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM
+powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-The script sets `GOOS/GOARCH/CGO_ENABLED=0` (fully static build) and **verifies the ELF magic bytes** to prevent accidentally shipping a Windows PE binary.
+Outputs go to `target/`: `honeypot-linux-amd64`, `ttyshow-linux-amd64`, `dbquery-linux-amd64` (arm64 similarly). The script verifies the first 4 bytes are `7F 45 4C 46` (ELF magic) to prevent accidentally shipping a Windows PE.
+
+> On a Linux build host you don't need the script — just `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot`. The scripts are mainly for Windows devs cross-compiling to a Linux deploy target.
+
+---
+
+## Deploying to Linux
 
 ### Transfer & systemd
 
 ```bash
-scp honeypot-linux-amd64 root@<server>:/opt/honeypot/honeypot
+scp target/honeypot-linux-amd64 root@<server>:/opt/honeypot/honeypot
 scp configs/honeypot.yaml root@<server>:/opt/honeypot/configs/honeypot.yaml
 ```
 
@@ -195,6 +220,49 @@ ReadWritePaths=/opt/honeypot/data /opt/honeypot/logs
 
 [Install]
 WantedBy=multi-user.target
+```
+
+### Binding a low port as non-root (e.g. 22)
+
+A non-root process cannot bind to privileged ports (< 1024) by default. Before binding the honeypot to 22, **move your real SSH off that port first**, otherwise you'll lock yourself out:
+
+```bash
+sed -i 's/^#\?Port .*/Port 2222/' /etc/ssh/sshd_config
+systemctl restart sshd
+# Confirm 2222 works before touching 22
+```
+
+**Option A: systemd ambient capability (recommended)**
+
+Cleanest — no binary patching, no NAT, and `User=honeypot` stays non-root. Add two lines to the service unit:
+
+```ini
+[Service]
+User=honeypot
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+After setting the listen port to 22, run `systemctl daemon-reload && systemctl restart honeypot`. The capability rides with the unit, so binary upgrades need no re-apply.
+
+**Option B: setcap file capability**
+
+Patch the binary directly (works because the project is statically compiled):
+
+```bash
+setcap 'cap_net_bind_service=+ep' /opt/honeypot/honeypot
+systemctl restart honeypot
+```
+
+Caveat: re-run `setcap` every time you overwrite the binary (the capability is not carried by file content). If the service uses `NoNewPrivileges=true`, some kernels don't inherit file capabilities — prefer Option A.
+
+**Option C: iptables redirect**
+
+Keep the honeypot on a high port (e.g. `2222`) and redirect inbound 22 to it — zero capability granted, most secure:
+
+```bash
+iptables -t nat -A PREROUTING -p tcp --dport 22 -j REDIRECT --to-port 2222
+iptables-save > /etc/iptables/rules.v4   # Debian, persist
 ```
 
 Deployment notes: open the honeypot port to the internet, **block outbound by default** (`iptables -A OUTPUT -m owner --uid-owner honeypot -j DROP`), isolate from production networks, run as non-root.
@@ -235,7 +303,7 @@ honeypot-go/
 │   ├── tty/             # ttyrec recording
 │   └── store/           # SQLite + JSONL persistence
 ├── configs/honeypot.yaml
-├── scripts/             # smoke test / cross-compile scripts
+├── scripts/             # build scripts (build-win.ps1 / build-linux.ps1) / smoke test
 └── docs/architecture.md # full architecture design
 ```
 

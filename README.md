@@ -158,21 +158,46 @@ data/
 
 ---
 
-## 部署到 Linux
+## 构建与编译
 
-### 交叉编译（Windows 上产 Linux ELF）
+`scripts/` 下提供 PowerShell 构建脚本，自动设置 `GOOS/GOARCH/CGO_ENABLED=0`（纯静态编译），并对产物做魔数校验，防止编出与目标平台不符的二进制。
+
+### 本机编译（Windows）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1              # amd64（默认）
+powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1 -Arch arm64  # ARM64
+```
+
+产物落在 `target/`：
+
+| 产物 | 说明 |
+|---|---|
+| `target/honeypot-windows-amd64.exe` | 蜜罐主程序 |
+| `target/ttyshow-windows-amd64.exe` | ttyrec 回放 |
+| `target/dbquery-windows-amd64.exe` | 事件查询 |
+
+脚本校验产物前 2 字节为 `MZ`（PE 魔数）。
+
+### 交叉编译（Windows → Linux ELF）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # amd64
-powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM
+powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-脚本自动设置 `GOOS/GOARCH/CGO_ENABLED=0`（纯静态编译），并**校验产物 ELF 魔数**，防止编出 Windows PE 二进制。
+产物落在 `target/`：`honeypot-linux-amd64`、`ttyshow-linux-amd64`、`dbquery-linux-amd64`（arm64 同理）。脚本校验产物前 4 字节为 `7F 45 4C 46`（ELF 魔数），可防止误编出 Windows PE。
+
+> 在 Linux 主机上本机编译不必用脚本，直接 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot` 即可。脚本主要给 Windows 开发者交叉编译到 Linux 部署机使用。
+
+---
+
+## 部署到 Linux
 
 ### 传输与 systemd 守护
 
 ```bash
-scp honeypot-linux-amd64 root@<server>:/opt/honeypot/honeypot
+scp target/honeypot-linux-amd64 root@<server>:/opt/honeypot/honeypot
 scp configs/honeypot.yaml root@<server>:/opt/honeypot/configs/honeypot.yaml
 ```
 
@@ -195,6 +220,49 @@ ReadWritePaths=/opt/honeypot/data /opt/honeypot/logs
 
 [Install]
 WantedBy=multi-user.target
+```
+
+### 非 root 绑定低位端口（如 22）
+
+非 root 进程默认不能绑定 1024 以下的特权端口。把蜜罐绑到 22 之前，**务必先给真实 SSH 挪端口**，否则会顶掉自己的登录通道把自己锁在外面：
+
+```bash
+sed -i 's/^#\?Port .*/Port 2222/' /etc/ssh/sshd_config
+systemctl restart sshd
+# 确认 2222 能连上后再动 22
+```
+
+**方案 A：systemd 发能力（推荐）**
+
+最干净，不改二进制、不依赖 NAT，`User=honeypot` 仍保持非 root。给 service 文件加两行：
+
+```ini
+[Service]
+User=honeypot
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+配置监听 22 后 `systemctl daemon-reload && systemctl restart honeypot` 即可。能力随 unit 持久，二进制升级无需重做。
+
+**方案 B：setcap 文件能力**
+
+不改 service，直接给二进制打能力（项目为静态编译，`setcap` 有效）：
+
+```bash
+setcap 'cap_net_bind_service=+ep' /opt/honeypot/honeypot
+systemctl restart honeypot
+```
+
+注意：重新覆盖二进制后必须再执行一次 `setcap`（能力不跟随文件内容）。若 service 启用 `NoNewPrivileges=true`，部分内核下 file capability 不继承，优先用方案 A。
+
+**方案 C：iptables 端口转发**
+
+蜜罐继续监听高位端口（如 `2222`），把入向 22 转发过去，零能力授予、最安全：
+
+```bash
+iptables -t nat -A PREROUTING -p tcp --dport 22 -j REDIRECT --to-port 2222
+iptables-save > /etc/iptables/rules.v4   # Debian，持久化
 ```
 
 部署要点：蜜罐端口对公网开放、**出站默认禁止**（`iptables -A OUTPUT -m owner --uid-owner honeypot -j DROP`）、与业务网段隔离、非 root 运行。
@@ -235,7 +303,7 @@ honeypot-go/
 │   ├── tty/             # ttyrec 录制
 │   └── store/           # SQLite + JSONL 持久化
 ├── configs/honeypot.yaml
-├── scripts/             # 冒烟测试 / 交叉编译脚本
+├── scripts/             # 构建脚本（build-win.ps1 / build-linux.ps1）/ 冒烟测试
 └── docs/architecture.md # 完整架构设计
 ```
 
