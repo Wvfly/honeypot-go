@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+# 同一分支/PR 的旧运行被新 push 取消，省 CI 分钟数
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- 格式 / 静态检查 / 单元测试 ----
+  test:
+    name: fmt + vet + build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt（要求全部文件已格式化）
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未经 gofmt 格式化："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build（含 cmd/ 下全部二进制）
+        run: go build ./...
+
+      - name: go mod tidy（校验 go.mod/go.sum 无漂移）
+        run: |
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          go mod tidy
+          if ! diff -q go.mod go.mod.orig >/dev/null || ! diff -q go.sum go.sum.orig >/dev/null; then
+            echo "go.mod/go.sum 与 'go mod tidy' 结果不一致，请在本地跑一遍 go mod tidy 并提交。"
+            diff go.mod.orig go.mod || true
+            diff go.sum.orig go.sum || true
+            exit 1
+          fi
+
+      - name: go test（含竞态检测与覆盖率）
+        run: go test ./... -race -cover -covermode=atomic -coverprofile=coverage.out
+
+      - name: 上传覆盖率报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  # ---- staticcheck ----
+  # 首次接入 CI 时未知历史代码上会报多少条，先设 continue-on-error 观察几轮，
+  # 确认没有大量历史噪音后，把下面这行删掉转正为强制门禁。
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: run staticcheck
+        continue-on-error: true # 见上方说明：观察期先不阻塞合并
+        run: staticcheck ./...
+
+  # ---- 交叉编译发布二进制：复用 scripts/build-linux.ps1 / build-win.ps1，
+  # 而不是在 workflow 里另写一份 go build 命令——避免本地开发者用的构建脚本
+  # 和 CI 实际产物脱节。GitHub 托管的 ubuntu-latest runner 自带 pwsh，不需要
+  # 单独安装；两个脚本都设置了 CGO_ENABLED=0，交叉编译不需要额外的 C 工具链
+  # （modernc.org/sqlite 是纯 Go 实现，不依赖 cgo）。产物统一落在 target/ 下。
+  build-linux:
+    name: build linux (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pwsh scripts/build-linux.ps1 -Arch ${{ matrix.arch }}
+        shell: pwsh
+        run: ./scripts/build-linux.ps1 -Arch ${{ matrix.arch }}
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-linux-${{ matrix.arch }}
+          path: |
+            target/honeypot-linux-${{ matrix.arch }}
+            target/ttyshow-linux-${{ matrix.arch }}
+            target/dbquery-linux-${{ matrix.arch }}
+          retention-days: 14
+
+  build-windows:
+    name: build windows (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pwsh scripts/build-win.ps1 -Arch ${{ matrix.arch }}
+        shell: pwsh
+        run: ./scripts/build-win.ps1 -Arch ${{ matrix.arch }}
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-windows-${{ matrix.arch }}
+          path: |
+            target/honeypot-windows-${{ matrix.arch }}.exe
+            target/ttyshow-windows-${{ matrix.arch }}.exe
+            target/dbquery-windows-${{ matrix.arch }}.exe
+          retention-days: 14
+
+  # ---- 端到端冒烟测试：复用 scripts/smoke.ps1（构建 -> 后台起蜜罐 -> 跑
+  # cmd/smoketest -> 清理），本地开发者和 CI 跑的是同一份脚本、同一份
+  # data/test.yaml 测试配置，不会出现"本地过了 CI 挂了"的行为不一致。
+  # 覆盖认证欺骗（弱口令/错误密码）、命令执行（管道/通配符/命令替换/重定向）、
+  # VNet 网络仿真、SFTP 子系统——单元测试覆盖不到的"作为一个完整服务跑起来对不对"。
+  smoketest:
+    name: end-to-end smoketest
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pwsh scripts/smoke.ps1
+        shell: pwsh
+        run: ./scripts/smoke.ps1
+
+      - name: 上传蜜罐日志与运行产物（排查用）
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoketest-artifacts
+          path: |
+            data/server.log
+            data/server.err
+            data/honeypot.db
+            data/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
