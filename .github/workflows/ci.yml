@@ -49,6 +49,7 @@ jobs:
             target/ttyshow-linux-${{ matrix.arch }}
             target/dbquery-linux-${{ matrix.arch }}
           retention-days: 14
+          if-no-files-found: error
 
   build-windows:
     name: build windows (${{ matrix.arch }})
@@ -78,6 +79,7 @@ jobs:
             target/ttyshow-windows-${{ matrix.arch }}.exe
             target/dbquery-windows-${{ matrix.arch }}.exe
           retention-days: 14
+          if-no-files-found: error
 
   release:
     name: publish release
@@ -100,4 +102,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
