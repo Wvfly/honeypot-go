@@ -133,6 +133,16 @@ func (e *Executor) History(sessionID string) []string {
 	return nil
 }
 
+// ClearHistory 清空会话历史展示缓冲（供 `history -c` 使用）。只影响 history
+// 命令展示给攻击者的内容；不影响审计侧记录，见调用处注释。
+func (e *Executor) ClearHistory(sessionID string) {
+	e.stMu.Lock()
+	defer e.stMu.Unlock()
+	if st := e.states[sessionID]; st != nil {
+		st.history = nil
+	}
+}
+
 // sessionPid 基于会话 ID 生成稳定的伪 shell PID（1000~60000），跨命令一致、会话间不同
 func sessionPid(sessionID string) string {
 	h := fnv.New32a()
@@ -173,12 +183,14 @@ func simDelay(bin string) {
 	maxMs := 25
 	switch bin {
 	case "find", "du", "grep", "egrep", "fgrep", "awk", "sed", "sort",
-		"tar", "gzip", "gunzip", "apt", "apt-get", "yum", "dnf", "make":
+		"tar", "gzip", "gunzip", "apt", "apt-get", "yum", "dnf", "make",
+		"useradd", "adduser", "userdel", "usermod":
 		maxMs = 250
 	case "cat", "head", "tail", "wc", "file", "stat", "ps", "top", "free", "df",
 		"mount", "ifconfig", "ip", "route", "netstat", "ss", "wget", "curl",
 		"traceroute", "ping", "dig", "nslookup", "host", "python", "python3",
-		"perl", "php", "ruby", "java", "git", "ssh", "scp", "rsync":
+		"perl", "php", "ruby", "java", "git", "ssh", "scp", "rsync",
+		"crontab", "passwd", "systemctl", "service", "iptables", "ip6tables", "ufw":
 		maxMs = 80
 	}
 	if maxMs > 0 {
@@ -392,6 +404,15 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "clear":
 		return cwd, 0, append(out, []byte("\x1b[H\x1b[2J")...)
 	case "history":
+		for _, a := range rest {
+			if a == "-c" {
+				// 清空展示给攻击者的历史缓冲；不影响审计侧记录——每条命令在
+				// Execute 完成时已经通过事件总线发布为 command.executed 事件，
+				// 独立于这里的展示缓冲，攻击者"清痕迹"的尝试本身也完整落库。
+				e.ClearHistory(ctx.sessionID)
+				return cwd, 0, out
+			}
+		}
 		hist := e.History(ctx.sessionID)
 		var hb strings.Builder
 		if len(hist) == 0 {
@@ -445,8 +466,30 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		return cwd, 0, append(out, []byte(lastlogText)...)
 	case "w":
 		return cwd, 0, append(out, e.wText()...)
-	case "kill", "jobs", "ln":
+	case "kill", "jobs", "ln", "pkill", "killall":
+		// pkill/killall：仿真环境没有真实后台进程表可查，静默成功
+		// （与真实 pkill 默认无输出的行为一致）。
 		return cwd, 0, out
+	case "vi", "vim", "nano", "screen", "tmux":
+		// 无真实全屏/模态编辑器或终端复用器，静默返回——与 runInterpreter
+		// 对纯交互调用（无内联代码）的简化处理保持一致，见该函数注释。
+		return cwd, 0, out
+	case "crontab":
+		return cwd, 0, append(out, e.crontabCmd(cwd, rest)...)
+	case "useradd", "adduser":
+		return cwd, 0, append(out, e.userAddCmd(bin, rest)...)
+	case "userdel":
+		return cwd, 0, append(out, e.userDelCmd(rest)...)
+	case "usermod":
+		return cwd, 0, append(out, e.usermodCmd(rest)...)
+	case "passwd":
+		return cwd, 0, append(out, e.passwdCmd(rest)...)
+	case "systemctl", "service":
+		return cwd, 0, append(out, e.systemctlCmd(bin, rest)...)
+	case "iptables", "ip6tables":
+		return cwd, 0, append(out, e.iptablesCmd(rest)...)
+	case "ufw":
+		return cwd, 0, append(out, e.ufwCmd(rest)...)
 	case "touch":
 		return cwd, 0, append(out, e.touchCmd(cwd, rest)...)
 	case "mkdir", "rmdir":
@@ -757,7 +800,12 @@ var knownPaths = map[string]string{
 	"apt-get": "/usr/bin/apt-get", "yum": "/usr/bin/yum", "dnf": "/usr/bin/dnf",
 	"gzip": "/bin/gzip", "gunzip": "/bin/gunzip", "make": "/usr/bin/make",
 	"git": "/usr/bin/git", "java": "/usr/bin/java", "rsync": "/usr/bin/rsync",
-	"top": "/usr/bin/top",
+	"top":     "/usr/bin/top",
+	"crontab": "/usr/bin/crontab", "useradd": "/usr/sbin/useradd", "adduser": "/usr/sbin/adduser",
+	"userdel": "/usr/sbin/userdel", "usermod": "/usr/sbin/usermod", "passwd": "/usr/bin/passwd",
+	"systemctl": "/usr/bin/systemctl", "service": "/usr/sbin/service",
+	"iptables": "/usr/sbin/iptables", "ip6tables": "/usr/sbin/ip6tables", "ufw": "/usr/sbin/ufw",
+	"pkill": "/usr/bin/pkill", "killall": "/usr/bin/killall",
 }
 
 // whichCmd 仿真 which：返回命令路径；未找到 exit 1（无输出）
@@ -1648,6 +1696,386 @@ func (e *Executor) rsyncCmd(cwd string, args []string) []byte {
 
 // netstatCmd 动态生成 netstat 输出：LISTEN 行与 ps 进程表联动（sshd 378/nginx 815/mysqld 920），
 // 非 -l 模式追加若干动态 ESTABLISHED 连接（本机 IP 与 ifconfig 一致），提升仿真真实度。
+// ---- crontab / 用户与账号管理 / systemctl / 防火墙 ----
+
+// crontabCmd 仿真 crontab：以 VFS 里 /var/spool/cron/crontabs/<user>（已在
+// bootstrap 阶段预置了一份看似真实的 root crontab）为唯一状态源，覆盖 -l
+// （查看）/-r（删除）/crontab FILE（从文件安装）三种最常见、且不需要真实
+// 交互式编辑器的用法。-e 需要打开 $EDITOR 交互编辑，本仿真 shell 没有真实的
+// 全屏模态编辑器（同 vi/nano，见 execOne 里的说明），按同样方式静默成功处理。
+//
+// 已知限制：真实攻击脚本常见的 `(crontab -l; echo job) | crontab -` 管道安装
+// 方式暂不支持——管道链目前只把上游输出转交给固定的过滤命令集合（grep/sed/awk
+// 等，见 parse.go 的 isFilter），crontab 不在其中，`crontab -` 读不到管道里的
+// 内容。要支持需要把 isFilter 的范围扩大成"愿意消费 stdin 的命令"这个更通用的
+// 概念，这个改动会影响 curl|bash 这类更常见的场景，值得单独一次改动处理。
+func (e *Executor) crontabCmd(cwd string, args []string) []byte {
+	const user = "root"
+	const crontabPath = "/var/spool/cron/crontabs/" + user
+
+	list, remove := false, false
+	var file string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-l" || a == "--list":
+			list = true
+		case a == "-r" || a == "--remove":
+			remove = true
+		case a == "-e" || a == "--edit":
+			return nil // 无真实交互编辑器，静默成功（同 vi/nano）
+		case a == "-u" || a == "--user":
+			i++ // 跳过用户名参数值：本仿真只有 root 一个身份，忽略具体取值
+		case strings.HasPrefix(a, "-"):
+			// 忽略其他选项
+		default:
+			file = a
+		}
+	}
+
+	switch {
+	case list:
+		content, err := e.fs.ReadFile(crontabPath)
+		if err != nil || len(content) == 0 {
+			return []byte("crontab: no crontab for " + user + "\n")
+		}
+		return content
+	case remove:
+		if _, err := e.fs.ReadFile(crontabPath); err != nil {
+			return []byte("crontab: no crontab for " + user + "\n")
+		}
+		_ = e.fs.Remove(crontabPath)
+		return nil
+	case file != "":
+		content, err := e.fs.ReadFile(absPath(cwd, file))
+		if err != nil {
+			return []byte(fmt.Sprintf("crontab: %s: No such file or directory\n", file))
+		}
+		if err := e.fs.WriteFile(crontabPath, content); err != nil {
+			return []byte(fmt.Sprintf("crontab: %s\n", err))
+		}
+		return nil
+	default:
+		return []byte("crontab: usage error: no arguments permitted after this option\n")
+	}
+}
+
+// userExistsInPasswd 检查 /etc/passwd 内容里是否已有该用户名的行。
+func userExistsInPasswd(content []byte, name string) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		if fields := strings.SplitN(line, ":", 2); len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// nextUID 扫描现有 /etc/passwd 找出下一个可用的普通用户 UID（从 1000 起）。
+func nextUID(passwdContent []byte) int {
+	max := 999
+	for _, line := range strings.Split(string(passwdContent), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if uid, err := strconv.Atoi(fields[2]); err == nil && uid > max {
+			max = uid
+		}
+	}
+	return max + 1
+}
+
+// filterPasswdLines 去掉 passwd/shadow 内容里以 "name:" 开头的行；若 homeOut
+// 非空指针，把该用户 passwd 行第 6 个字段（家目录）写回去，供 userdel -r 用。
+func filterPasswdLines(content []byte, name string, homeOut *string) []byte {
+	var kept []string
+	for _, line := range strings.Split(string(content), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) > 0 && fields[0] == name {
+			if homeOut != nil && len(fields) >= 6 {
+				*homeOut = fields[5]
+			}
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(kept, "\n") + "\n")
+}
+
+// userAddCmd 仿真 useradd/adduser：往 /etc/passwd、/etc/shadow 各追加一行，
+// 默认创建家目录（useradd 需要显式 -m，adduser 默认就建，和真实 Debian 行为
+// 一致）。按调用名区分输出风格：useradd 成功时静默，adduser 打印 Debian 那套
+// 啰嗦的 "Adding user ... / Adding new group ... " 提示。
+// 简化：不写 /etc/group（大多数检测/取证价值集中在 passwd/shadow 上，加组
+// 这块留空不影响可观测性）。
+func (e *Executor) userAddCmd(bin string, args []string) []byte {
+	var name, shell, home string
+	system := false
+	makeHome := bin == "adduser"
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-m" || a == "--create-home":
+			makeHome = true
+		case a == "-M" || a == "--no-create-home":
+			makeHome = false
+		case a == "-r" || a == "--system":
+			system = true
+		case a == "-s" || a == "--shell":
+			if i+1 < len(args) {
+				i++
+				shell = args[i]
+			}
+		case a == "-d" || a == "--home" || a == "--home-dir":
+			if i+1 < len(args) {
+				i++
+				home = args[i]
+			}
+		case a == "--gecos":
+			if i+1 < len(args) {
+				i++ // 跳过 gecos 字段取值
+			}
+		case strings.HasPrefix(a, "-"):
+			// 忽略其他选项（--disabled-password/--ingroup 等）
+		default:
+			if name == "" {
+				name = a
+			}
+		}
+	}
+	if name == "" {
+		return []byte(bin + ": usage error, no username given\n")
+	}
+
+	passwdContent, _ := e.fs.ReadFile("/etc/passwd")
+	if userExistsInPasswd(passwdContent, name) {
+		return []byte(fmt.Sprintf("%s: user '%s' already exists\n", bin, name))
+	}
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	if home == "" {
+		home = "/home/" + name
+	}
+	uid := nextUID(passwdContent)
+	line := fmt.Sprintf("%s:x:%d:%d:%s:%s:%s\n", name, uid, uid, name, home, shell)
+	_ = e.fs.WriteFile("/etc/passwd", append(passwdContent, []byte(line)...))
+
+	shadowContent, _ := e.fs.ReadFile("/etc/shadow")
+	shadowLine := fmt.Sprintf("%s:!:19800:0:99999:7:::\n", name) // "!" = 未设密码/锁定，与真实 useradd 默认一致
+	_ = e.fs.WriteFile("/etc/shadow", append(shadowContent, []byte(shadowLine)...))
+
+	if makeHome && !system {
+		_ = e.fs.Mkdir(home, "drwxr-xr-x", name, name)
+	}
+
+	if bin != "adduser" {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Adding user `%s' ...\n", name)
+	fmt.Fprintf(&b, "Adding new group `%s' (%d) ...\n", name, uid)
+	fmt.Fprintf(&b, "Adding new user `%s' (%d) with group `%s' ...\n", name, uid, name)
+	if makeHome && !system {
+		fmt.Fprintf(&b, "Creating home directory `%s' ...\n", home)
+		fmt.Fprintf(&b, "Copying files from `/etc/skel' ...\n")
+	}
+	return []byte(b.String())
+}
+
+// userDelCmd 仿真 userdel：从 /etc/passwd、/etc/shadow 中删掉匹配行；-r 额外
+// 删除家目录；拒绝删除 root（与真实 userdel 的保护行为一致）。
+func (e *Executor) userDelCmd(args []string) []byte {
+	removeHome := false
+	var name string
+	for _, a := range args {
+		switch {
+		case a == "-r" || a == "--remove":
+			removeHome = true
+		case strings.HasPrefix(a, "-"):
+		default:
+			name = a
+		}
+	}
+	if name == "" {
+		return []byte("userdel: usage error, no username given\n")
+	}
+	passwdContent, _ := e.fs.ReadFile("/etc/passwd")
+	if !userExistsInPasswd(passwdContent, name) {
+		return []byte(fmt.Sprintf("userdel: user '%s' does not exist\n", name))
+	}
+	if name == "root" {
+		return []byte("userdel: user 'root' is a member of the group 'root', which is the primary group of other users. Refusing to remove.\n")
+	}
+	var home string
+	_ = e.fs.WriteFile("/etc/passwd", filterPasswdLines(passwdContent, name, &home))
+	shadowContent, _ := e.fs.ReadFile("/etc/shadow")
+	_ = e.fs.WriteFile("/etc/shadow", filterPasswdLines(shadowContent, name, nil))
+	if removeHome && home != "" {
+		_ = e.fs.RemoveAll(home)
+	}
+	return nil
+}
+
+// usermodCmd 仿真 usermod：只做用户存在性检查，真实改动（换 shell/加组等）
+// 一律静默成功——与真实 usermod 无冲突时无输出的行为一致。LOGIN 在真实
+// usermod 的用法里总是最后一个位置参数，因此"最后一个非选项 token"始终就是
+// 用户名，不需要逐个识别每个选项各自带几个参数值。
+func (e *Executor) usermodCmd(args []string) []byte {
+	var name string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			name = a
+		}
+	}
+	if name == "" {
+		return []byte("usermod: usage error, no username given\n")
+	}
+	passwdContent, _ := e.fs.ReadFile("/etc/passwd")
+	if !userExistsInPasswd(passwdContent, name) {
+		return []byte(fmt.Sprintf("usermod: user '%s' does not exist\n", name))
+	}
+	return nil
+}
+
+// passwdCmd 仿真 passwd：真实 passwd 需要交互式隐藏输入两次密码确认，本仿真
+// shell 没有这套机制（同 vi/nano 的限制）。这里只检查用户是否存在，给出与
+// 真实工具一致的收尾提示；不真正改写 shadow 密码哈希——对可观测性没有影响，
+// 命令原文（含尝试设置的新密码，如果直接跟在参数里）已经被完整记录。
+func (e *Executor) passwdCmd(args []string) []byte {
+	name := "root"
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			name = a
+			break
+		}
+	}
+	passwdContent, _ := e.fs.ReadFile("/etc/passwd")
+	if !userExistsInPasswd(passwdContent, name) {
+		return []byte(fmt.Sprintf("passwd: user '%s' does not exist\n", name))
+	}
+	return []byte("passwd: password updated successfully\n")
+}
+
+// serviceDesc 返回常见服务的描述文案，供 systemctl status 拼接输出。
+func serviceDesc(svc string) string {
+	switch svc {
+	case "ssh", "sshd":
+		return "OpenBSD Secure Shell server"
+	case "cron":
+		return "Regular background program processing daemon"
+	case "rsyslog":
+		return "System Logging Service"
+	case "networking":
+		return "Raise network interfaces"
+	default:
+		return svc
+	}
+}
+
+// systemctlCmd 仿真 systemctl（Debian/Ubuntu 主流）与老式 service 封装。
+// status 对已知常驻服务（ssh/cron/rsyslog/networking）给出 active(running)，
+// 其余视为未安装；start/stop/restart/enable/disable 等改状态操作一律静默
+// 成功，与真实 systemd 在无冲突场景下的输出一致。
+func (e *Executor) systemctlCmd(bin string, args []string) []byte {
+	var pos []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			pos = append(pos, a)
+		}
+	}
+
+	var sub, svc string
+	if bin == "service" {
+		// service <name> <sub>：与 systemctl 参数顺序相反
+		if len(pos) < 1 {
+			return []byte("Usage: service < option > | --status-all | [ service_name [ command ] ]\n")
+		}
+		svc = pos[0]
+		if len(pos) > 1 {
+			sub = pos[1]
+		} else {
+			sub = "status"
+		}
+	} else {
+		if len(pos) == 0 {
+			return nil
+		}
+		sub = pos[0]
+		if len(pos) > 1 {
+			svc = pos[1]
+		}
+	}
+	svc = strings.TrimSuffix(svc, ".service")
+	running := map[string]bool{"ssh": true, "sshd": true, "cron": true, "rsyslog": true, "networking": true}
+
+	switch sub {
+	case "status":
+		if svc != "" && running[svc] {
+			since := time.Now().Add(-72 * time.Hour).Format("Mon 2006-01-02 15:04:05 MST")
+			return []byte(fmt.Sprintf("● %s.service - %s\n   Loaded: loaded (/lib/systemd/system/%s.service; enabled; vendor preset: enabled)\n   Active: active (running) since %s\n",
+				svc, serviceDesc(svc), svc, since))
+		}
+		if bin == "service" {
+			return []byte(fmt.Sprintf(" * %s is not running\n", svc))
+		}
+		return []byte(fmt.Sprintf("Unit %s.service could not be found.\n", svc))
+	case "start", "stop", "restart", "reload", "enable", "disable", "mask", "unmask", "daemon-reload", "force-reload":
+		return nil
+	case "list-units", "list-unit-files":
+		return []byte("UNIT                    LOAD   ACTIVE SUB     DESCRIPTION\n" +
+			"ssh.service             loaded active running OpenBSD Secure Shell server\n" +
+			"cron.service            loaded active running Regular background program processing daemon\n")
+	default:
+		return []byte(fmt.Sprintf("Unknown operation '%s'.\n", sub))
+	}
+}
+
+// iptablesCmd 仿真 iptables/ip6tables：-L/-S 给一份默认全通策略（新装云主机
+// 的常见出厂状态），-F/-A/-I/-D/-N/-X 等改规则操作一律静默成功——真实攻击链
+// 里 "iptables -F" 是部署矿机/后门前的标配收尾动作，这里让它跑通而不是 127。
+func (e *Executor) iptablesCmd(args []string) []byte {
+	for _, a := range args {
+		switch a {
+		case "-L", "--list":
+			return []byte("Chain INPUT (policy ACCEPT)\ntarget     prot opt source               destination\n\n" +
+				"Chain FORWARD (policy ACCEPT)\ntarget     prot opt source               destination\n\n" +
+				"Chain OUTPUT (policy ACCEPT)\ntarget     prot opt source               destination\n")
+		case "-S", "--list-rules":
+			return []byte("-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n")
+		}
+	}
+	return nil
+}
+
+// ufwCmd 仿真 Ubuntu 的 ufw：新装机器防火墙默认未启用；enable/disable/allow/
+// deny 给出与真实 ufw 一致的确认文案（不维护真实规则状态）。
+func (e *Executor) ufwCmd(args []string) []byte {
+	if len(args) == 0 {
+		return []byte("ERROR: Invalid syntax\n")
+	}
+	switch args[0] {
+	case "status":
+		return []byte("Status: inactive\n")
+	case "enable":
+		return []byte("Firewall is active and enabled on system startup\n")
+	case "disable":
+		return []byte("Firewall stopped and disabled on system startup\n")
+	case "allow", "deny", "reject", "limit":
+		return []byte("Rule added\n")
+	case "delete":
+		return []byte("Rule deleted\n")
+	default:
+		return []byte(fmt.Sprintf("ERROR: Invalid command '%s'\n", args[0]))
+	}
+}
+
 func netstatCmd(args []string) []byte {
 	joined := strings.Join(args, " ")
 	listenOnly := strings.Contains(joined, "-l") || strings.Contains(joined, "--listening")
