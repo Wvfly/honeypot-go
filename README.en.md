@@ -148,11 +148,12 @@ data/
 └── host_key             # SSH host key (sensitive, never commit)
 ```
 
-| Tool | Purpose | Usage |
-|---|---|---|
-| `cmd/dbquery` | Print all 5 tables (connections/attempts/sessions/commands/extended events) | `go run ./cmd/dbquery` |
-| `cmd/ttyshow` | Replay ttyrec recordings as timestamped text | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
-| SQLite join | Correlate all behavior per attacker IP | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
+| Tool | Purpose                                                                                  | Usage |
+|---|------------------------------------------------------------------------------------------|---|
+| `cmd/dbquery` | Print all 5 tables (connections/attempts/sessions/commands/extended events)              | `go run ./cmd/dbquery` |
+| `cmd/ttyshow` | Replay ttyrec recordings as timestamped text                                             | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
+| `cmd/anti_attack` | SSH anti attack: listen & bounce traffic back to the client's source IP on the same port | `go run ./cmd/anti_attack -port 22 -log logs/anti_attack.log` |
+| SQLite join | Correlate all behavior per attacker IP                                                   | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
 > `auth_attempts` stores the **plaintext password** of every attempt; `commands` stores exit code / duration / output preview per command; the generic `events` table carries extended events (download / connect / file write / alert) with JSON payload.
 
@@ -171,11 +172,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1 -Arch arm64  # AR
 
 Outputs go to `target/`:
 
-| Artifact | Description |
-|---|---|
+| Artifact | Description          |
+|---|----------------------|
 | `target/honeypot-windows-amd64.exe` | honeypot main binary |
-| `target/ttyshow-windows-amd64.exe` | ttyrec replay |
-| `target/dbquery-windows-amd64.exe` | event query |
+| `target/ttyshow-windows-amd64.exe` | ttyrec replay        |
+| `target/dbquery-windows-amd64.exe` | event query          |
+| `target/anti_attack-windows-amd64.exe` | SSH anti attack      |
 
 The script verifies the first 2 bytes are `MZ` (PE magic).
 
@@ -186,9 +188,43 @@ powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # am
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-Outputs go to `target/`: `honeypot-linux-amd64`, `ttyshow-linux-amd64`, `dbquery-linux-amd64` (arm64 similarly). The script verifies the first 4 bytes are `7F 45 4C 46` (ELF magic) to prevent accidentally shipping a Windows PE.
+Outputs go to `target/`: `honeypot-linux-amd64`, `ttyshow-linux-amd64`, `dbquery-linux-amd64`, `anti_attack-linux-amd64` (arm64 similarly). The script verifies the first 4 bytes are `7F 45 4C 46` (ELF magic) to prevent accidentally shipping a Windows PE.
 
 > On a Linux build host you don't need the script — just `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot`. The scripts are mainly for Windows devs cross-compiling to a Linux deploy target.
+
+---
+
+## anti_attack: SSH Anti Attack
+
+`cmd/anti_attack` is a standalone companion to the honeypot: it listens on a local port, and on each accepted connection grabs the client's source IP, then dials back to that source IP on the same port and bidirectionally relays bytes. In a honeypot setup it's typically placed in front: an attacker scanning the port sees their traffic bounced back to themselves — no local real service exposed, while every incoming connection still gets logged (IP, byte counts, timing).
+
+**Usage**
+
+```powershell
+anti_attack.exe -port 22 -log logs/anti_attack.log -log-level info
+```
+
+**Flags**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-port` | `22` | Local listen port. On accept, dial back to the client's source IP on this same port. |
+| `-log` | `logs/anti_attack.log` | Log file path; rotates per day, then size-based sub-rotation with gzip. |
+| `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
+| `-log-size` | `100` | Max MB per log file before rotation. |
+| `-log-backups` | `7` | Number of old log files to keep. |
+| `-log-age` | `30` | Max days to retain old log files. |
+| `-log-compress` | `true` | gzip rotated log files. |
+
+**Log layout**
+
+Rotates per day into `logs/anti_attack-YYYY-MM-DD.log`. If that file exceeds `-log-size` it is archived as a timestamped sub-file and gzipped. Files older than `-log-age` days are auto-cleaned.
+
+**Working with the honeypot & binding 22 as non-root**
+
+`-port` defaults to 22 (privileged port — non-root can't bind it). The three authorization options (systemd `AmbientCapabilities` / `setcap` / iptables redirect) are described in the next section: "Deploying to Linux / Binding a low port as non-root".
+
+If you'd rather avoid granting capabilities, point `-port` at a high port (e.g. `2222`) and have the honeypot listen on the same port. Attackers scanning `2222` hit `anti_attack` first and get bounced back, while the honeypot still serves high-interaction emulation independently.
 
 ---
 
@@ -288,7 +324,8 @@ honeypot-go/
 │   ├── honeypot/        # entry: wiring, graceful shutdown
 │   ├── smoketest/       # smoke test client
 │   ├── dbquery/         # SQLite ops query
-│   └── ttyshow/         # ttyrec replay
+│   ├── ttyshow/         # ttyrec replay
+│   └── anti_attack/     # TCP reverse proxy: bounce traffic back to client's source IP on the same port
 ├── internal/
 │   ├── config/          # YAML config load & validation
 │   ├── event/           # event bus (publish/subscribe decoupling)

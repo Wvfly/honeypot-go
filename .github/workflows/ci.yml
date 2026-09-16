@@ -48,6 +48,7 @@ jobs:
             target/honeypot-linux-${{ matrix.arch }}
             target/ttyshow-linux-${{ matrix.arch }}
             target/dbquery-linux-${{ matrix.arch }}
+            target/anti_attack-linux-${{ matrix.arch }}
           retention-days: 14
           if-no-files-found: error
 
@@ -78,6 +79,7 @@ jobs:
             target/honeypot-windows-${{ matrix.arch }}.exe
             target/ttyshow-windows-${{ matrix.arch }}.exe
             target/dbquery-windows-${{ matrix.arch }}.exe
+            target/anti_attack-windows-${{ matrix.arch }}.exe
           retention-days: 14
           if-no-files-found: error
 

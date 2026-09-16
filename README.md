@@ -148,11 +148,12 @@ data/
 └── host_key             # SSH 主机密钥（机密，勿提交）
 ```
 
-| 工具 | 用途 | 用法 |
-|---|---|---|
-| `cmd/dbquery` | 打印全部 5 张表（连接/爆破/会话/命令/扩展事件） | `go run ./cmd/dbquery` |
-| `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本 | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
-| SQLite 关联查询 | 按 IP 关联攻击者全部行为 | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
+| 工具 | 用途                               | 用法 |
+|---|----------------------------------|---|
+| `cmd/dbquery` | 打印全部 5 张表（连接/爆破/会话/命令/扩展事件）      | `go run ./cmd/dbquery` |
+| `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本              | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
+| `cmd/anti_attack` | SSH攻击反制：监听端口并把流量反弹回客户端源 IP 的同一端口 | `go run ./cmd/anti_attack -port 22 -log logs/anti_attack.log` |
+| SQLite 关联查询 | 按 IP 关联攻击者全部行为                   | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
 > `auth_attempts` 记录每次爆破的**密码原文**；`commands` 记录每条命令的 exit code / 耗时 / 输出摘要；`events` 通用表承载扩展事件（下载/连接/文件写入/告警），payload 为 JSON。
 
@@ -171,11 +172,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1 -Arch arm64  # AR
 
 产物落在 `target/`：
 
-| 产物 | 说明 |
-|---|---|
-| `target/honeypot-windows-amd64.exe` | 蜜罐主程序 |
+| 产物 | 说明        |
+|---|-----------|
+| `target/honeypot-windows-amd64.exe` | 蜜罐主程序     |
 | `target/ttyshow-windows-amd64.exe` | ttyrec 回放 |
-| `target/dbquery-windows-amd64.exe` | 事件查询 |
+| `target/dbquery-windows-amd64.exe` | 事件查询      |
+| `target/anti_attack-windows-amd64.exe` | ssh攻击反制   |
 
 脚本校验产物前 2 字节为 `MZ`（PE 魔数）。
 
@@ -186,9 +188,43 @@ powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # am
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-产物落在 `target/`：`honeypot-linux-amd64`、`ttyshow-linux-amd64`、`dbquery-linux-amd64`（arm64 同理）。脚本校验产物前 4 字节为 `7F 45 4C 46`（ELF 魔数），可防止误编出 Windows PE。
+产物落在 `target/`：`honeypot-linux-amd64`、`ttyshow-linux-amd64`、`dbquery-linux-amd64`、`anti_attack-linux-amd64`（arm64 同理）。脚本校验产物前 4 字节为 `7F 45 4C 46`（ELF 魔数），可防止误编出 Windows PE。
 
 > 在 Linux 主机上本机编译不必用脚本，直接 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot` 即可。脚本主要给 Windows 开发者交叉编译到 Linux 部署机使用。
+
+---
+
+## anti_attack：SSH攻击反制
+
+`cmd/anti_attack` 是与蜜罐配套的独立工具：监听本机一个端口，accept 后取客户端源 IP，反弹连回该源 IP 的同一端口，然后双向透传字节流。蜜罐场景下常作为诱导层放在蜜罐前面：攻击者扫到本机端口，流量被反弹回他自己的同一端口——既不暴露本地真实服务，也能记录来连的 IP / 字节数 / 时间。
+
+**用法**
+
+```powershell
+anti_attack.exe -port 22 -log logs/anti_attack.log -log-level info
+```
+
+**flag**
+
+| flag | 默认 | 含义 |
+|---|---|---|
+| `-port` | `22` | 本机监听端口；客户端来连后反弹连回其源 IP 的同一端口 |
+| `-log` | `logs/anti_attack.log` | 日志文件路径；按天切分文件名，超阈值时再切子文件并 gzip |
+| `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
+| `-log-size` | `100` | 单日志文件最大 MB，超出滚动 |
+| `-log-backups` | `7` | 保留几个旧日志文件 |
+| `-log-age` | `30` | 旧日志最多保留天数 |
+| `-log-compress` | `true` | 是否 gzip 压缩已滚动出去的日志 |
+
+**日志落地**
+
+按天切分到 `logs/anti_attack-YYYY-MM-DD.log`；当天单文件超 `-log-size` 后滚动为带时间戳的子文件并 gzip；超过 `-log-age` 天的旧文件自动清理。
+
+**与蜜罐配合 & 非 root 绑定 22**
+
+`anti_attack` 默认监听 `-port 22`（特权端口）。非 root 进程绑不上 1024 以下的端口，三种授权方案详见下节「部署到 Linux / 非 root 绑定低位端口」。
+
+如果不想给授权，把 `-port` 改高位（如 `2222`），蜜罐也改监听同一高位端口即可——攻击者扫到 `2222` 时先打到 `anti_attack`，由 `anti_attack` 反弹回去，蜜罐仍可独立监听做高交互仿真。
 
 ---
 
@@ -288,7 +324,8 @@ honeypot-go/
 │   ├── honeypot/        # 入口：装配、信号优雅退出
 │   ├── smoketest/       # 冒烟测试客户端
 │   ├── dbquery/         # SQLite 运营查询
-│   └── ttyshow/         # ttyrec 录制回放
+│   ├── ttyshow/         # ttyrec 录制回放
+│   └── anti_attack/     # SSH 攻击反制：监听端口反弹回客户端源 IP 的同一端口
 ├── internal/
 │   ├── config/          # YAML 配置加载与校验
 │   ├── event/           # 事件总线（发布/订阅解耦）
