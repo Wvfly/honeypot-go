@@ -4,9 +4,9 @@
 // 然后双向透传字节流。蜜罐场景下常作为诱导层：攻击者扫到本机端口，
 // 流量被反弹回他自己的同一端口——既不暴露本地真实服务，也能记录来连。
 //
-// 日志按天滚动到 logs/<base>-YYYY-MM-DD.log；
-// 同一文件超过 -log-size 后归档为带时间戳的子文件并 gzip 压缩；
-// 超过 -log-age 天的旧文件自动清理。
+// 日志写入 -log 指定的活跃文件；超阈值后由 lumberjack 归档为
+// <name>-YYYYMMDDTHHMMSS.NNN.log.gz（NNN 为同秒内的滚动序号，从 000 起），
+// 旧归档超过 -log-age 天自动清理。
 //
 // 用法：
 //
@@ -25,10 +25,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
-	"sync"
 	"syscall"
-	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -36,7 +33,7 @@ import (
 func main() {
 	var (
 		port        = flag.Int("port", 22, "本机监听端口；客户端连进来后，反弹连回其源 IP 的同一端口")
-		logPath     = flag.String("log", "logs/anti_attack.log", "日志文件路径；按天切分文件名，超阈值时再切子文件并 gzip")
+		logPath     = flag.String("log", "logs/anti_attack.log", "活跃日志文件名；超阈值后归档为 <name>-YYYYMMDDTHHMMSS.NNN.log.gz，NNN 为同秒内的滚动序号")
 		logLevel    = flag.String("log-level", "info", "日志等级：debug/info/warn/error")
 		logSize     = flag.Int("log-size", 100, "单日志文件最大 MB，超出滚动")
 		logBackups  = flag.Int("log-backups", 7, "保留几个旧日志文件")
@@ -58,8 +55,14 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	base := strings.TrimSuffix(filepath.Base(*logPath), filepath.Ext(*logPath))
-	w := newDailyRotatingWriter(dir, base, *logSize, *logBackups, *logAge, *logCompress)
+	w := &lumberjack.Logger{
+		Filename:   *logPath,
+		MaxSize:    *logSize,
+		MaxBackups: *logBackups,
+		MaxAge:     *logAge,
+		Compress:   *logCompress,
+		LocalTime:  true,
+	}
 	defer w.Close()
 
 	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl}))
@@ -185,70 +188,6 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return m, err
 }
 
-// dailyRotatingWriter 在 lumberjack 之上做"按天 + 按 size"双策略滚动：
-// 每天切到一个带日期的新文件（anti_attack-2026-09-16.log）；
-// 同一天内超 -log-size 时由 lumberjack 滚动为带时间戳的子文件并按 Compress gzip；
-// 超过 -log-age 天的旧文件由 lumberjack 自动清理。
-type dailyRotatingWriter struct {
-	mu       sync.Mutex
-	dir      string
-	base     string
-	maxSize  int
-	backups  int
-	age      int
-	compress bool
-	cur      *lumberjack.Logger
-	curDate  string
-}
-
-func newDailyRotatingWriter(dir, base string, maxSize, backups, age int, compress bool) *dailyRotatingWriter {
-	w := &dailyRotatingWriter{
-		dir:      dir,
-		base:     base,
-		maxSize:  maxSize,
-		backups:  backups,
-		age:      age,
-		compress: compress,
-	}
-	w.rotateIfNeeded(time.Now())
-	return w
-}
-
-func (w *dailyRotatingWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.rotateIfNeeded(time.Now())
-	return w.cur.Write(p)
-}
-
-func (w *dailyRotatingWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.cur != nil {
-		return w.cur.Close()
-	}
-	return nil
-}
-
-func (w *dailyRotatingWriter) rotateIfNeeded(now time.Time) {
-	today := now.Format("2006-01-02")
-	if w.cur != nil && w.curDate == today {
-		return
-	}
-	if w.cur != nil {
-		_ = w.cur.Close()
-	}
-	w.cur = &lumberjack.Logger{
-		Filename:   filepath.Join(w.dir, w.base+"-"+today+".log"),
-		MaxSize:    w.maxSize,
-		MaxBackups: w.backups,
-		MaxAge:     w.age,
-		Compress:   w.compress,
-		LocalTime:  true,
-	}
-	w.curDate = today
-}
-
 func parseLevel(s string) (slog.Level, error) {
 	switch s {
 	case "debug":
@@ -266,7 +205,7 @@ func parseLevel(s string) (slog.Level, error) {
 
 // localIPs 枚举本机所有 unicast 接口地址（不限网卡名——eth0/ens33/wlan0/br-xxx/
 // vethxxx/wg0 等都会被 net.InterfaceAddrs 枚举到），并显式补上 loopback
-//（net.InterfaceAddrs 按文档不返回 loopback，但攻击者伪源 127.0.0.1 也会触发
+// （net.InterfaceAddrs 按文档不返回 loopback，但攻击者伪源 127.0.0.1 也会触发
 // self-loop，所以要手动纳入过滤集）。
 func localIPs() ([]net.IP, error) {
 	var ips []net.IP
