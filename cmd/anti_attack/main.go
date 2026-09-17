@@ -69,6 +69,14 @@ func main() {
 		"level", *logLevel,
 	)
 
+	locals, err := localIPs()
+	if err != nil {
+		logger.Error("enumerate local IPs failed", "err", err)
+		os.Exit(1)
+	}
+	localSet := &ipSet{ips: locals}
+	logger.Info("local IP filter loaded", "count", len(locals))
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -96,17 +104,28 @@ func main() {
 			logger.Warn("accept failed", "err", err)
 			continue
 		}
-		go handleConn(c, *port, logger)
+		go handleConn(c, *port, localSet, logger)
 	}
 }
 
 // handleConn 处理单条连接：反弹连回客户端源 IP 的同一端口，然后双向 io.Copy。
-func handleConn(c net.Conn, listenPort int, logger *slog.Logger) {
+func handleConn(c net.Conn, listenPort int, localSet *ipSet, logger *slog.Logger) {
 	defer c.Close()
 
 	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
 	if err != nil {
 		logger.Warn("bad remote addr", "err", err)
+		return
+	}
+	srcIP := net.ParseIP(host)
+	if srcIP == nil {
+		logger.Warn("parse remote IP failed", "host", host)
+		return
+	}
+	if localSet.contains(srcIP) {
+		// 伪源 IP 反射型 DoS 防护：源 IP 命中本机任意网卡地址，反弹会打回自己监听端口。
+		logger.Warn("drop connection from local IP (spoofed source)",
+			"src", c.RemoteAddr().String())
 		return
 	}
 	target := net.JoinHostPort(host, strconv.Itoa(listenPort))
@@ -243,4 +262,56 @@ func parseLevel(s string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("invalid -log-level %q (want debug|info|warn|error)", s)
 	}
+}
+
+// localIPs 枚举本机所有 unicast 接口地址（不限网卡名——eth0/ens33/wlan0/br-xxx/
+// vethxxx/wg0 等都会被 net.InterfaceAddrs 枚举到），并显式补上 loopback
+//（net.InterfaceAddrs 按文档不返回 loopback，但攻击者伪源 127.0.0.1 也会触发
+// self-loop，所以要手动纳入过滤集）。
+func localIPs() ([]net.IP, error) {
+	var ips []net.IP
+
+	// 显式补 loopback：net.InterfaceAddrs / Interface.Addrs 都不返回
+	ips = append(ips, net.IPv4(127, 0, 0, 1))
+	ips = append(ips, net.ParseIP("::1"))
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			continue
+		}
+		if ip == nil {
+			continue
+		}
+		// 跳过 multicast（TCP 源不能是多播，纳入过滤无意义）
+		if ip.IsMulticast() {
+			continue
+		}
+		ips = append(ips, ip)
+	}
+	return ips, nil
+}
+
+// ipSet 加速 net.IP 的 contains 查询，用 Equal 比较（兼容 IPv4-mapped IPv6 等格式差异）。
+type ipSet struct{ ips []net.IP }
+
+func (s *ipSet) contains(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, l := range s.ips {
+		if l.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
