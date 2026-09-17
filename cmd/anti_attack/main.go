@@ -43,16 +43,12 @@ func main() {
 		pidfile     = flag.String("pidfile", "logs/anti_attack.pid", "PID 文件路径；daemon 模式启动后会自动写入当前 PID")
 	)
 	flag.BoolVar(daemon, "d", false, "同 -daemon")
-	flag.Parse()
 
-	// 检测内部标志，避免父死循环子、子死循环孙
-	isChild := false
-	for _, a := range os.Args[1:] {
-		if a == "-d-child" {
-			isChild = true
-			break
-		}
-	}
+	// 检测子进程身份用环境变量，不用 args——否则子进程 flag.Parse
+	// 会撞到未注册的 -d-child → os.Exit(2)
+	isChild := os.Getenv("ANTI_ATTACK_DAEMON_CHILD") == "1"
+
+	flag.Parse()
 
 	if *daemon && !isChild {
 		pid, err := daemonize()
@@ -62,6 +58,12 @@ func main() {
 		}
 		fmt.Printf("anti_attack daemonized, pid=%d\n", pid)
 		os.Exit(0)
+	}
+
+	// daemon 子进程忽略 SIGHUP：父 shell 退出时所有 jobs 会收到 SIGHUP，
+	// daemon 子进程应继续运行而不是跟着退出。
+	if isChild {
+		signal.Ignore(syscall.SIGHUP)
 	}
 
 	lvl, err := parseLevel(*logLevel)
