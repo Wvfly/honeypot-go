@@ -209,22 +209,32 @@ anti_attack.exe -port 22 -log logs/anti_attack.log -log-level info
 | Flag | Default | Meaning |
 |---|---|---|
 | `-port` | `22` | Local listen port. On accept, dial back to the client's source IP on this same port. |
-| `-log` | `logs/anti_attack.log` | Log file path; rotates per day, then size-based sub-rotation with gzip. |
+| `-log` | `logs/anti_attack.log` | Active log file name; rotated by lumberjack to `<name>-YYYYMMDDTHHMMSS.NNN.log.gz` once `-log-size` is exceeded (NNN is the rotation index within the same second). |
 | `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
 | `-log-size` | `100` | Max MB per log file before rotation. |
 | `-log-backups` | `7` | Number of old log files to keep. |
 | `-log-age` | `30` | Max days to retain old log files. |
 | `-log-compress` | `true` | gzip rotated log files. |
+| `-d` / `--daemon` | `false` | Run in the background: fork a child detached from the terminal. Linux only. |
+| `-pidfile` | `logs/anti_attack.pid` | PID file path; the current PID is written here after daemon-mode startup. |
 
 **Log layout**
 
-Rotates per day into `logs/anti_attack-YYYY-MM-DD.log`. If that file exceeds `-log-size` it is archived as a timestamped sub-file and gzipped. Files older than `-log-age` days are auto-cleaned.
+Active log is written to the file specified by `-log`. When it exceeds `-log-size`, lumberjack archives it as `anti_attack-YYYYMMDDTHHMMSS.NNN.log.gz` (the `.000` / `.001` suffix is the rotation index within the same second). Archives older than `-log-age` days are auto-cleaned.
 
 **Working with the honeypot & binding 22 as non-root**
 
 `-port` defaults to 22 (privileged port — non-root can't bind it). The three authorization options (systemd `AmbientCapabilities` / `setcap` / iptables redirect) are described in the next section: "Deploying to Linux / Binding a low port as non-root".
 
 If you'd rather avoid granting capabilities, point `-port` at a high port (e.g. `2222`) and have the honeypot listen on the same port. Attackers scanning `2222` hit `anti_attack` first and get bounced back, while the honeypot still serves high-interaction emulation independently.
+
+**Running as a background daemon (Linux)**
+
+```bash
+./anti_attack-linux-amd64 -port 22 -log logs/anti_attack.log -d
+```
+
+The parent prints the child's PID and exits; the child lives on in a new session detached from the terminal (stdin/stdout/stderr go to `/dev/null`). The PID is written to `logs/anti_attack.pid` by default — override with `-pidfile <path>`. On Windows, use `nssm` or `sc.exe CreateService` to register it as a service.
 
 ---
 

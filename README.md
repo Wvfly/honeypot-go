@@ -209,22 +209,32 @@ anti_attack.exe -port 22 -log logs/anti_attack.log -log-level info
 | flag | 默认 | 含义 |
 |---|---|---|
 | `-port` | `22` | 本机监听端口；客户端来连后反弹连回其源 IP 的同一端口 |
-| `-log` | `logs/anti_attack.log` | 日志文件路径；按天切分文件名，超阈值时再切子文件并 gzip |
+| `-log` | `logs/anti_attack.log` | 活跃日志文件名；超阈值后由 lumberjack 归档为 `<name>-YYYYMMDDTHHMMSS.NNN.log.gz`（NNN 为同秒内的滚动序号） |
 | `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
 | `-log-size` | `100` | 单日志文件最大 MB，超出滚动 |
 | `-log-backups` | `7` | 保留几个旧日志文件 |
 | `-log-age` | `30` | 旧日志最多保留天数 |
 | `-log-compress` | `true` | 是否 gzip 压缩已滚动出去的日志 |
+| `-d` / `--daemon` | `false` | 后台运行：fork 出子进程脱离终端，仅 Linux |
+| `-pidfile` | `logs/anti_attack.pid` | PID 文件路径；daemon 模式启动后自动写入当前 PID |
 
 **日志落地**
 
-按天切分到 `logs/anti_attack-YYYY-MM-DD.log`；当天单文件超 `-log-size` 后滚动为带时间戳的子文件并 gzip；超过 `-log-age` 天的旧文件自动清理。
+活跃日志写入 `-log` 指定的文件；超 `-log-size` 后由 lumberjack 归档为 `anti_attack-YYYYMMDDTHHMMSS.NNN.log.gz`（`.000` / `.001` 为同秒内的滚动序号），超过 `-log-age` 天的旧归档自动清理。
 
 **与蜜罐配合 & 非 root 绑定 22**
 
 `anti_attack` 默认监听 `-port 22`（特权端口）。非 root 进程绑不上 1024 以下的端口，三种授权方案详见下节「部署到 Linux / 非 root 绑定低位端口」。
 
 如果不想给授权，把 `-port` 改高位（如 `2222`），蜜罐也改监听同一高位端口即可——攻击者扫到 `2222` 时先打到 `anti_attack`，由 `anti_attack` 反弹回去，蜜罐仍可独立监听做高交互仿真。
+
+**后台启动（Linux）**
+
+```bash
+./anti_attack-linux-amd64 -port 22 -log logs/anti_attack.log -d
+```
+
+父进程打印子 PID 后退出，子进程在新会话里独立运行（日志走文件，stdin/stdout/stderr 接到 `/dev/null`）。PID 默认写到 `logs/anti_attack.pid`，可用 `-pidfile <path>` 自定义。Windows 想后台请用 `nssm` 或 `sc.exe CreateService`。
 
 ---
 

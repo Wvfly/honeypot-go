@@ -39,8 +39,30 @@ func main() {
 		logBackups  = flag.Int("log-backups", 7, "保留几个旧日志文件")
 		logAge      = flag.Int("log-age", 30, "旧日志最多保留天数")
 		logCompress = flag.Bool("log-compress", true, "是否 gzip 压缩已滚动出去的日志")
+		daemon      = flag.Bool("daemon", false, "后台运行：fork 出子进程脱离终端，仅 Linux")
+		pidfile     = flag.String("pidfile", "logs/anti_attack.pid", "PID 文件路径；daemon 模式启动后会自动写入当前 PID")
 	)
+	flag.BoolVar(daemon, "d", false, "同 -daemon")
 	flag.Parse()
+
+	// 检测内部标志，避免父死循环子、子死循环孙
+	isChild := false
+	for _, a := range os.Args[1:] {
+		if a == "-d-child" {
+			isChild = true
+			break
+		}
+	}
+
+	if *daemon && !isChild {
+		pid, err := daemonize()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "daemonize failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("anti_attack daemonized, pid=%d\n", pid)
+		os.Exit(0)
+	}
 
 	lvl, err := parseLevel(*logLevel)
 	if err != nil {
@@ -71,6 +93,14 @@ func main() {
 		"log", *logPath,
 		"level", *logLevel,
 	)
+
+	if *pidfile != "" {
+		if err := os.WriteFile(*pidfile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+			logger.Warn("write pidfile failed", "err", err, "path", *pidfile)
+		} else {
+			logger.Info("pidfile written", "path", *pidfile)
+		}
+	}
 
 	locals, err := localIPs()
 	if err != nil {
