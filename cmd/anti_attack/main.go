@@ -4,9 +4,9 @@
 // 然后双向透传字节流。蜜罐场景下常作为诱导层：攻击者扫到本机端口，
 // 流量被反弹回他自己的同一端口——既不暴露本地真实服务，也能记录来连。
 //
-// 日志写入 -log 指定的活跃文件；超阈值后由 lumberjack 归档为
+// 日志写入 -log 指定的活跃文件；跨天时把前一天内容归档为
 // <name>-YYYYMMDDTHHMMSS.NNN.log.gz（NNN 为同秒内的滚动序号，从 000 起），
-// 旧归档超过 -log-age 天自动清理。
+// 同一天内超 -log-size 时由 lumberjack 自滚动，超 -log-age 天的旧归档自动清理。
 //
 // 用法：
 //
@@ -25,7 +25,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -79,14 +81,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	w := &lumberjack.Logger{
-		Filename:   *logPath,
-		MaxSize:    *logSize,
-		MaxBackups: *logBackups,
-		MaxAge:     *logAge,
-		Compress:   *logCompress,
-		LocalTime:  true,
-	}
+	w := newDailyRotatingWriter(*logPath, *logSize, *logBackups, *logAge, *logCompress)
 	defer w.Close()
 
 	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl}))
@@ -233,6 +228,72 @@ func parseLevel(s string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("invalid -log-level %q (want debug|info|warn|error)", s)
 	}
+}
+
+// dailyRotatingWriter 在 lumberjack 之上做"按天"触发：
+// 跨天时主动 Rotate 当前文件（lumberjack 会把它归档成带时间戳+序号的 .gz），
+// 再重建 lumberjack 实例继续写同 filename 的活跃文件——保证活跃文件名
+// 不变，同时保证跨天一定有归档。同一文件超 -log-size 时由 lumberjack 自己做
+// size-based 滚动（同秒内用 .000/.001 区分）。
+type dailyRotatingWriter struct {
+	mu       sync.Mutex
+	filename string
+	maxSize  int
+	backups  int
+	age      int
+	compress bool
+	cur      *lumberjack.Logger
+	curDate  string
+}
+
+func newDailyRotatingWriter(filename string, maxSize, backups, age int, compress bool) *dailyRotatingWriter {
+	w := &dailyRotatingWriter{
+		filename: filename,
+		maxSize:  maxSize,
+		backups:  backups,
+		age:      age,
+		compress: compress,
+	}
+	w.rotateIfNeeded(time.Now())
+	return w
+}
+
+func (w *dailyRotatingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rotateIfNeeded(time.Now())
+	return w.cur.Write(p)
+}
+
+func (w *dailyRotatingWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cur != nil {
+		return w.cur.Close()
+	}
+	return nil
+}
+
+func (w *dailyRotatingWriter) rotateIfNeeded(now time.Time) {
+	today := now.Format("2006-01-02")
+	if w.cur != nil && w.curDate == today {
+		return
+	}
+	// 跨天：先 Rotate 当前文件（lumberjack 会把它归档成带时间戳+序号的 .gz），
+	// 再 Close 释放文件句柄
+	if w.cur != nil {
+		_ = w.cur.Rotate()
+		_ = w.cur.Close()
+	}
+	w.cur = &lumberjack.Logger{
+		Filename:   w.filename,
+		MaxSize:    w.maxSize,
+		MaxBackups: w.backups,
+		MaxAge:     w.age,
+		Compress:   w.compress,
+		LocalTime:  true,
+	}
+	w.curDate = today
 }
 
 // localIPs 枚举本机所有 unicast 接口地址（不限网卡名——eth0/ens33/wlan0/br-xxx/
