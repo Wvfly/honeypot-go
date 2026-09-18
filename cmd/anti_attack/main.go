@@ -109,7 +109,7 @@ func main() {
 		logger.Error("enumerate local IPs failed", "err", err)
 		os.Exit(1)
 	}
-	localSet := &ipSet{ips: locals}
+	localSet := &ipSet{nets: locals}
 	logger.Info("local IP filter loaded", "count", len(locals))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -236,15 +236,17 @@ func parseLevel(s string) (slog.Level, error) {
 }
 
 // localIPs 枚举本机所有 unicast 接口地址（不限网卡名——eth0/ens33/wlan0/br-xxx/
-// vethxxx/wg0 等都会被 net.InterfaceAddrs 枚举到），并显式补上 loopback
-// （net.InterfaceAddrs 按文档不返回 loopback，但攻击者伪源 127.0.0.1 也会触发
-// self-loop，所以要手动纳入过滤集）。
-func localIPs() ([]net.IP, error) {
-	var ips []net.IP
+// vethxxx/wg0 等都会被 net.InterfaceAddrs 枚举到），并显式纳入 loopback 整段
+// 127.0.0.0/8（不只是 127.0.0.1——整个 127.0.0.0/8 都是 loopback，攻击者用
+// 127.0.0.2/127.1.2.3 等伪源 IP 都能反弹到本机）和 IPv6 ::1/128。
+func localIPs() ([]*net.IPNet, error) {
+	var nets []*net.IPNet
 
-	// 显式补 loopback：net.InterfaceAddrs / Interface.Addrs 都不返回
-	ips = append(ips, net.IPv4(127, 0, 0, 1))
-	ips = append(ips, net.ParseIP("::1"))
+	// 显式纳入 loopback 整段：net.InterfaceAddrs 按文档不返回 loopback
+	_, loopback4, _ := net.ParseCIDR("127.0.0.0/8")
+	nets = append(nets, loopback4)
+	_, loopback6, _ := net.ParseCIDR("::1/128")
+	nets = append(nets, loopback6)
 
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -267,20 +269,28 @@ func localIPs() ([]net.IP, error) {
 		if ip.IsMulticast() {
 			continue
 		}
-		ips = append(ips, ip)
+		// 单 IP 转成 /32 或 /128 的 IPNet，便于统一 Contains 比较
+		var mask net.IPMask
+		if ip.To4() != nil {
+			mask = net.CIDRMask(32, 32)
+		} else {
+			mask = net.CIDRMask(128, 128)
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: mask})
 	}
-	return ips, nil
+	return nets, nil
 }
 
-// ipSet 加速 net.IP 的 contains 查询，用 Equal 比较（兼容 IPv4-mapped IPv6 等格式差异）。
-type ipSet struct{ ips []net.IP }
+// ipSet 用 IPNet.Contains 做命中判断（兼容 IPv4-mapped IPv6 等格式差异，
+// 自动覆盖整段 CIDR，不只精确 IP）。
+type ipSet struct{ nets []*net.IPNet }
 
 func (s *ipSet) contains(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	for _, l := range s.ips {
-		if l.Equal(ip) {
+	for _, n := range s.nets {
+		if n.Contains(ip) {
 			return true
 		}
 	}
