@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,33 +33,116 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// 子进程标记与就绪管道都用环境变量传递，不走 args：
+// 否则子进程 flag.Parse 会撞到未注册的 flag → os.Exit(2)。
+const (
+	envDaemonChild = "ANTI_ATTACK_DAEMON_CHILD"
+	envReadyFD     = "ANTI_ATTACK_READY_FD"
+)
+
+// readyPipe 是 daemon 子进程继承自父进程的就绪管道；非 daemon 模式为 nil。
+var readyPipe *os.File
+
+// reportReady 通过就绪管道向父进程报告 "OK" 或 "ERR: ..."，随后关闭管道（只报告一次）。
+func reportReady(msg string) {
+	if readyPipe == nil {
+		return
+	}
+	_, _ = readyPipe.WriteString(msg + "\n")
+	_ = readyPipe.Close()
+	readyPipe = nil
+}
+
+// fatal 打印错误并退出；在 daemon 子进程里同时通过就绪管道把原因带给父进程，
+// 这样 `-d` 启动失败时终端上能直接看到原因，而不是只有一个 exit status。
+func fatal(code int, format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintln(os.Stderr, msg)
+	reportReady("ERR: " + msg)
+	os.Exit(code)
+}
+
+// childArgs 按当前解析结果重建传给 daemon 子进程的参数：
+// 逐个 flag 显式传值（去掉 -d/-daemon），不依赖用户当初怎么写的（-d、-daemon、-d=true…），
+// 也保证父进程转好的绝对路径会原样传下去。
+func childArgs() []string {
+	var args []string
+	flag.VisitAll(func(f *flag.Flag) {
+		if f.Name == "d" || f.Name == "daemon" {
+			return
+		}
+		args = append(args, "-"+f.Name+"="+f.Value.String())
+	})
+	return args
+}
+
 func main() {
 	var (
-		port        = flag.Int("port", 22, "本机监听端口；客户端连进来后，反弹连回其源 IP 的同一端口")
-		logPath     = flag.String("log", "logs/anti_attack.log", "活跃日志文件名；超阈值后归档为 <name>-YYYYMMDDTHHMMSS.NNN.log.gz，NNN 为同秒内的滚动序号")
+		port        = flag.Int("port", 22, "本机监听端口；客户端连进来后，代理连回其源 IP 的同一端口")
+		logPath     = flag.String("log", "logs/anti_attack.log", "活跃日志文件名；归档为 <name>-YYYY-MM-DDTHH-MM-SS.mmm.log.gz（时间戳为轮转时刻，mmm 为毫秒）")
 		logLevel    = flag.String("log-level", "info", "日志等级：debug/info/warn/error")
 		logSize     = flag.Int("log-size", 100, "单日志文件最大 MB，超出滚动")
-		logBackups  = flag.Int("log-backups", 7, "保留几个旧日志文件")
-		logAge      = flag.Int("log-age", 30, "旧日志最多保留天数")
+		logBackups  = flag.Int("log-backups", 0, "保留几个旧日志文件；0 表示不限个数，仅按 -log-age 清理")
+		logAge      = flag.Int("log-age", 30, "旧日志最多保留天数（与 -log-backups 任一先达到即删除）")
 		logCompress = flag.Bool("log-compress", true, "是否 gzip 压缩已滚动出去的日志")
-		daemon      = flag.Bool("daemon", false, "后台运行：fork 出子进程脱离终端，仅 Linux")
-		pidfile     = flag.String("pidfile", "logs/anti_attack.pid", "PID 文件路径；daemon 模式启动后会自动写入当前 PID")
+		daemon      = flag.Bool("daemon", false, "后台运行：fork 出子进程脱离终端，仅 Linux；子进程就绪后父进程才返回，失败原因直接打印；panic 等 stderr 输出写入 <-log 去掉扩展名>.stderr")
+		pidfile     = flag.String("pidfile", "logs/anti_attack.pid", "PID 文件路径；成功监听后写入，正常退出时删除；daemon 模式下写入失败视为启动失败；留空则不写")
 	)
 	flag.BoolVar(daemon, "d", false, "同 -daemon")
 
-	// 检测子进程身份用环境变量，不用 args——否则子进程 flag.Parse
-	// 会撞到未注册的 -d-child → os.Exit(2)
-	isChild := os.Getenv("ANTI_ATTACK_DAEMON_CHILD") == "1"
+	isChild := os.Getenv(envDaemonChild) == "1"
+	if isChild {
+		if fd, err := strconv.Atoi(os.Getenv(envReadyFD)); err == nil && fd > 2 {
+			readyPipe = os.NewFile(uintptr(fd), "ready")
+		}
+	}
 
 	flag.Parse()
 
-	if *daemon && !isChild {
-		pid, err := daemonize()
+	// —— 参数校验：放在 fork 之前，错误直接显示在终端 ——
+	if *port < 1 || *port > 65535 {
+		fatal(2, "invalid -port %d (want 1-65535)", *port)
+	}
+	lvl, err := parseLevel(*logLevel)
+	if err != nil {
+		fatal(2, "%v", err)
+	}
+
+	daemonParent := *daemon && !isChild
+	if daemonParent {
+		// daemon 不切换工作目录，从不同目录（cron/systemd 的 cwd 常是 /）启动会落到不同位置，
+		// 所以 fork 前统一转成绝对路径，再原样传给子进程。
+		if *logPath, err = filepath.Abs(*logPath); err != nil {
+			fatal(1, "resolve -log: %v", err)
+		}
+		if *pidfile != "" {
+			if *pidfile, err = filepath.Abs(*pidfile); err != nil {
+				fatal(1, "resolve -pidfile: %v", err)
+			}
+		}
+	}
+
+	// 日志目录和 pidfile 目录都要建（两者可以不在同一目录）
+	if err := os.MkdirAll(filepath.Dir(*logPath), 0o755); err != nil {
+		fatal(1, "mkdir log dir: %v", err)
+	}
+	if *pidfile != "" {
+		if err := os.MkdirAll(filepath.Dir(*pidfile), 0o755); err != nil {
+			fatal(1, "mkdir pidfile dir: %v", err)
+		}
+	}
+
+	if daemonParent {
+		stderrPath := strings.TrimSuffix(*logPath, filepath.Ext(*logPath)) + ".stderr"
+		pid, err := daemonize(childArgs(), stderrPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "daemonize failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("anti_attack daemonized, pid=%d\n", pid)
+		fmt.Printf("anti_attack daemonized, pid=%d\n  log:    %s\n  stderr: %s\n", pid, *logPath, stderrPath)
+		if *pidfile != "" {
+			fmt.Printf("  pidfile: %s\n", *pidfile)
+		}
 		os.Exit(0)
 	}
 
@@ -68,19 +152,23 @@ func main() {
 		signal.Ignore(syscall.SIGHUP)
 	}
 
-	lvl, err := parseLevel(*logLevel)
+	// —— 先监听，再碰日志和 pidfile ——
+	// 端口被占用时，失败的实例不应该污染已运行实例的日志，更不能覆盖它的 pidfile。
+	locals, err := localIPs()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		fatal(1, "enumerate local IPs failed: %v", err)
+	}
+	localSet := &ipSet{nets: locals}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	addr := ":" + strconv.Itoa(*port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fatal(1, "listen %s failed: %v", addr, err)
 	}
 
-	dir := filepath.Dir(*logPath)
-	if dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "mkdir log dir: %v\n", err)
-			os.Exit(1)
-		}
-	}
 	w := newDailyRotatingWriter(*logPath, *logSize, *logBackups, *logAge, *logCompress)
 	defer w.Close()
 
@@ -89,34 +177,28 @@ func main() {
 		"port", *port,
 		"log", *logPath,
 		"level", *logLevel,
+		"daemon", isChild,
 	)
+	logger.Info("local IP filter loaded", "count", len(locals))
+	logger.Info("listening", "addr", addr)
 
 	if *pidfile != "" {
 		if err := os.WriteFile(*pidfile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+			if isChild {
+				// daemon 模式下 pidfile 是唯一的控制入口，写不进去就等于无法管理，按启动失败处理
+				logger.Error("write pidfile failed", "err", err, "path", *pidfile)
+				_ = ln.Close()
+				fatal(1, "write pidfile %s failed: %v", *pidfile, err)
+			}
 			logger.Warn("write pidfile failed", "err", err, "path", *pidfile)
 		} else {
 			logger.Info("pidfile written", "path", *pidfile)
+			defer removePidfile(*pidfile, logger)
 		}
 	}
 
-	locals, err := localIPs()
-	if err != nil {
-		logger.Error("enumerate local IPs failed", "err", err)
-		os.Exit(1)
-	}
-	localSet := &ipSet{nets: locals}
-	logger.Info("local IP filter loaded", "count", len(locals))
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	addr := ":" + strconv.Itoa(*port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		logger.Error("listen failed", "addr", addr, "err", err)
-		os.Exit(1)
-	}
-	logger.Info("listening", "addr", addr)
+	// 监听成功、日志和 pidfile 都就绪：通知父进程可以返回了
+	reportReady("OK")
 
 	// 收到信号就关 listener，accept 循环退出；已 accept 的连接跑完为止。
 	go func() {
@@ -138,6 +220,23 @@ func main() {
 	}
 }
 
+// removePidfile 仅当 pidfile 里记的还是自己的 PID 时才删除，
+// 避免误删别的实例（例如换了端口的另一个实例）写的 pidfile。
+func removePidfile(path string, logger *slog.Logger) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if strings.TrimSpace(string(b)) != strconv.Itoa(os.Getpid()) {
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		logger.Warn("remove pidfile failed", "err", err, "path", path)
+		return
+	}
+	logger.Info("pidfile removed", "path", path)
+}
+
 // handleConn 处理单条连接：反弹连回客户端源 IP 的同一端口，然后双向 io.Copy。
 func handleConn(c net.Conn, listenPort int, localSet *ipSet, logger *slog.Logger) {
 	defer c.Close()
@@ -153,7 +252,6 @@ func handleConn(c net.Conn, listenPort int, localSet *ipSet, logger *slog.Logger
 		return
 	}
 	if localSet.contains(srcIP) {
-		// 伪源 IP 反射型 DoS 防护：源 IP 命中本机任意网卡地址，反弹会打回自己监听端口。
 		logger.Warn("drop connection from local IP (spoofed source)",
 			"src", c.RemoteAddr().String())
 		return
@@ -161,7 +259,6 @@ func handleConn(c net.Conn, listenPort int, localSet *ipSet, logger *slog.Logger
 	target := net.JoinHostPort(host, strconv.Itoa(listenPort))
 	upstream, err := net.Dial("tcp", target)
 	if err != nil {
-		// 攻击者本机该端口通常没人在听，反弹失败属于正常情况，记 warn 即可。
 		logger.Warn("dial upstream failed", "target", target, "err", err)
 		return
 	}
@@ -230,76 +327,104 @@ func parseLevel(s string) (slog.Level, error) {
 	}
 }
 
-// dailyRotatingWriter 在 lumberjack 之上做"按天"触发：
-// 跨天时主动 Rotate 当前文件（lumberjack 会把它归档成带时间戳+序号的 .gz），
-// 再重建 lumberjack 实例继续写同 filename 的活跃文件——保证活跃文件名
-// 不变，同时保证跨天一定有归档。同一文件超 -log-size 时由 lumberjack 自己做
-// size-based 滚动（同秒内用 .000/.001 区分）。
+// dailyRotatingWriter 在 lumberjack 之上做"按天"触发。
+//
+// 全程只持有一个 lumberjack.Logger，跨天时对它调用 Rotate()（归档当前文件并
+// 新建同名活跃文件）。不要在跨天时重建 Logger：每个 Logger 各带一个后台压缩
+// 协程，旧实例 Rotate 触发的压缩与新实例首次写入触发的压缩会并发处理同一个
+// 备份文件，后完成的一方 os.Remove(src) 失败后会把先完成方刚生成的 .gz 一并
+// 删掉，导致整天日志既无源文件也无归档（日志越大，两个压缩协程重叠得越久，
+// 越容易触发）。
+//
+// 归档的触发时机：
+//  1. 启动时：活跃文件非空且最后修改日期不是今天，说明上次运行跨过了天，先归档；
+//  2. 每次 Write 前：日期变了就归档；
+//  3. 每天本地 0 点的定时器：即使当天 0 点之后没有日志写入也按时归档，
+//     归档文件名里的时间戳（即轮转时刻）因此接近 00:00:00，与内容所属日期一致。
+//
+// 同一文件超过 -log-size 时由 lumberjack 自己做 size-based 滚动。
 type dailyRotatingWriter struct {
-	mu       sync.Mutex
-	filename string
-	maxSize  int
-	backups  int
-	age      int
-	compress bool
-	cur      *lumberjack.Logger
-	curDate  string
+	mu      sync.Mutex
+	lj      *lumberjack.Logger
+	curDate string
+	timer   *time.Timer
+	closed  bool
 }
+
+const dateLayout = "2006-01-02"
 
 func newDailyRotatingWriter(filename string, maxSize, backups, age int, compress bool) *dailyRotatingWriter {
 	w := &dailyRotatingWriter{
-		filename: filename,
-		maxSize:  maxSize,
-		backups:  backups,
-		age:      age,
-		compress: compress,
+		lj: &lumberjack.Logger{
+			Filename:   filename,
+			MaxSize:    maxSize,
+			MaxBackups: backups,
+			MaxAge:     age,
+			Compress:   compress,
+			LocalTime:  true,
+		},
 	}
-	w.rotateIfNeeded(time.Now())
+	now := time.Now()
+	w.curDate = now.Format(dateLayout)
+	// 已有非空的旧文件：以其最后修改日期作为它所属的日期，
+	// 若不是今天，下面的 rotateIfNeeded 会立刻把它归档。
+	if fi, err := os.Stat(filename); err == nil && fi.Size() > 0 {
+		w.curDate = fi.ModTime().Format(dateLayout)
+	}
+	w.rotateIfNeeded(now)
+	w.scheduleMidnight(now)
 	return w
+}
+
+// rotateIfNeeded 在日期变化时归档当前活跃文件。调用方须持有 w.mu（构造函数除外）。
+func (w *dailyRotatingWriter) rotateIfNeeded(now time.Time) {
+	today := now.Format(dateLayout)
+	if w.curDate == today {
+		return
+	}
+	// 空文件（或文件不存在）不必归档，避免产生空的 .gz
+	if fi, err := os.Stat(w.lj.Filename); err == nil && fi.Size() > 0 {
+		if err := w.lj.Rotate(); err != nil {
+			// 不更新 curDate：下次写入 / 定时器触发时会重试，而不是静默等到明天
+			fmt.Fprintf(os.Stderr, "log rotate failed: %v\n", err)
+			return
+		}
+	}
+	w.curDate = today
+}
+
+// scheduleMidnight 安排下一个本地 0 点的轮转检查。调用方须持有 w.mu（构造函数除外）。
+func (w *dailyRotatingWriter) scheduleMidnight(now time.Time) {
+	next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	w.timer = time.AfterFunc(next.Sub(now), func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.closed {
+			return
+		}
+		n := time.Now()
+		w.rotateIfNeeded(n)
+		w.scheduleMidnight(n)
+	})
 }
 
 func (w *dailyRotatingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.rotateIfNeeded(time.Now())
-	return w.cur.Write(p)
+	return w.lj.Write(p)
 }
 
 func (w *dailyRotatingWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.cur != nil {
-		return w.cur.Close()
+	w.closed = true
+	if w.timer != nil {
+		w.timer.Stop()
 	}
-	return nil
+	return w.lj.Close()
 }
 
-func (w *dailyRotatingWriter) rotateIfNeeded(now time.Time) {
-	today := now.Format("2006-01-02")
-	if w.cur != nil && w.curDate == today {
-		return
-	}
-	// 跨天：先 Rotate 当前文件（lumberjack 会把它归档成带时间戳+序号的 .gz），
-	// 再 Close 释放文件句柄
-	if w.cur != nil {
-		_ = w.cur.Rotate()
-		_ = w.cur.Close()
-	}
-	w.cur = &lumberjack.Logger{
-		Filename:   w.filename,
-		MaxSize:    w.maxSize,
-		MaxBackups: w.backups,
-		MaxAge:     w.age,
-		Compress:   w.compress,
-		LocalTime:  true,
-	}
-	w.curDate = today
-}
-
-// localIPs 枚举本机所有 unicast 接口地址（不限网卡名——eth0/ens33/wlan0/br-xxx/
-// vethxxx/wg0 等都会被 net.InterfaceAddrs 枚举到），并显式纳入 loopback 整段
-// 127.0.0.0/8（不只是 127.0.0.1——整个 127.0.0.0/8 都是 loopback，攻击者用
-// 127.0.0.2/127.1.2.3 等伪源 IP 都能反弹到本机）和 IPv6 ::1/128。
 func localIPs() ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 
