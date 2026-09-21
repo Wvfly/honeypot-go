@@ -18,14 +18,33 @@ import (
 // - 通过随机延迟模拟真实密码校验耗时，防止用户名枚举的时间侧信道；
 // - 支持 password / keyboard-interactive / publickey 三种方法（与真实 OpenSSH 行为对齐）。
 type Authenticator struct {
-	cfg    config.AuthConfig
-	bus    *event.Bus
-	logger *slog.Logger
+	cfg     config.AuthConfig
+	bus     *event.Bus
+	logger  *slog.Logger
+	allowed map[string]struct{} // 允许登录的用户名；nil 表示不限制
 }
 
-// New 创建认证欺骗器
-func New(cfg config.AuthConfig, bus *event.Bus, logger *slog.Logger) *Authenticator {
-	return &Authenticator{cfg: cfg, bus: bus, logger: logger}
+// New 创建认证欺骗器。users 是虚拟系统里真实存在的用户（vfs.users）；
+// cfg.RestrictUsers 为 true 时，只有这些用户名才可能"登录成功"，其余用户名一律拒绝
+// （与真实 sshd 一致：不存在的用户永远登不进去）。
+func New(cfg config.AuthConfig, users []string, bus *event.Bus, logger *slog.Logger) *Authenticator {
+	a := &Authenticator{cfg: cfg, bus: bus, logger: logger}
+	if cfg.RestrictUsers {
+		a.allowed = make(map[string]struct{}, len(users))
+		for _, u := range users {
+			a.allowed[u] = struct{}{}
+		}
+	}
+	return a
+}
+
+// UserAllowed 该用户名是否允许登录。用户名区分大小写，与 Linux 一致（Root ≠ root）。
+func (a *Authenticator) UserAllowed(username string) bool {
+	if a.allowed == nil {
+		return true
+	}
+	_, ok := a.allowed[username]
+	return ok
 }
 
 // Check 校验一次 password 认证尝试，返回是否放行
@@ -76,8 +95,10 @@ func (a *Authenticator) checkPassword(connID, username, password, method string)
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 	}
 
+	// 不存在的用户即使口令命中也拒绝；延迟与记录路径和其他失败完全一致，
+	// 不给攻击者留下"用户是否存在"的时间/行为侧信道。
 	hit := slices.Contains(a.cfg.WeakPasswords, password)
-	success := hit && rand.Float64() < a.cfg.SuccessProbability
+	success := hit && a.UserAllowed(username) && rand.Float64() < a.cfg.SuccessProbability
 	a.record(connID, username, password, method, success, delay, "")
 
 	if success {

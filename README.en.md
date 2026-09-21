@@ -116,6 +116,7 @@ auth:
   keyboard_interactive: true  # keyboard-interactive auth toggle (default on)
   publickey: true             # public-key auth toggle (default on; recorded, always rejected)
   allow_no_auth: false        # allow probe login (high-value sessions, default off)
+  restrict_users: true        # only usernames in vfs.users can log in (default on; false = any username works once a weak password hits)
   weak_passwords: [root, admin, password, 123456, ...]   # weak password dictionary
 
 vfs:

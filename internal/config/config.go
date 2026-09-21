@@ -46,6 +46,9 @@ type AuthConfig struct {
 	// 允许"探测性登录"：真实服务器若配置了 NOPASSWD 用户会直接放行。
 	// 蜜罐中用于制造高价值会话，默认关闭。
 	AllowNoAuth bool `yaml:"allow_no_auth"`
+	// RestrictUsers 只允许 vfs.users 里列出的用户名"登录成功"（默认开启）。
+	// 真实服务器上不存在的用户永远登不进去；关闭后任意用户名只要弱口令命中即可放行。
+	RestrictUsers bool `yaml:"restrict_users"`
 }
 
 type VFSConfig struct {
@@ -83,6 +86,7 @@ func Default() *Config {
 			KeyboardInteractive: true,
 			PublicKey:           true,
 			AllowNoAuth:         false,
+			RestrictUsers:       true,
 		},
 		VFS: VFSConfig{
 			Hostname: "ubuntu-web-01",
@@ -140,6 +144,9 @@ func (c *Config) Validate() error {
 		// yaml 未显式配置（零值 false）时保持默认开启，模拟真实 OpenSSH
 		c.Auth.KeyboardInteractive = true
 		c.Auth.PublicKey = true
+	}
+	if c.Auth.RestrictUsers && len(c.VFS.Users) == 0 {
+		return fmt.Errorf("vfs.users must not be empty when auth.restrict_users is true (nobody could log in)")
 	}
 	if c.Storage.DataDir == "" {
 		c.Storage.DataDir = "data"

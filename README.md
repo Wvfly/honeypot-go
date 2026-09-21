@@ -116,6 +116,7 @@ auth:
   keyboard_interactive: true  # keyboard-interactive 认证开关（默认开）
   publickey: true             # 公钥认证开关（默认开，记录后必拒）
   allow_no_auth: false        # 允许探测性登录（制造高价值会话，默认关）
+  restrict_users: true        # 只允许 vfs.users 里的用户名登录成功（默认开；false=任意用户名弱口令命中即放行）
   weak_passwords: [root, admin, password, 123456, ...]   # 弱口令库
 
 vfs:

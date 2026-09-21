@@ -52,7 +52,7 @@ func main() {
 	}
 
 	// 认证欺骗层
-	authn := auth.New(cfg.Auth, bus, logger)
+	authn := auth.New(cfg.Auth, cfg.VFS.Users, bus, logger)
 
 	// SSH 服务端
 	srv, err := sshsrv.New(cfg, bus, authn, logger)

@@ -23,6 +23,9 @@ auth:
   # 允许探测性登录：真实服务器若配置 NOPASSWD 用户会直接放行，
   # 蜜罐中用于制造高价值会话，默认关闭
   allow_no_auth: false
+  # 只允许 vfs.users 里列出的用户名登录成功（默认开启）。
+  # 真实服务器上不存在的用户永远登不进去；设为 false 则任意用户名弱口令命中即可放行。
+  restrict_users: true
   weak_passwords:
     - root
     - admin

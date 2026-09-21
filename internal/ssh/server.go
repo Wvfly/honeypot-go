@@ -271,6 +271,13 @@ func (s *Server) handleConn(nc net.Conn) {
 	}
 	if s.cfg.Auth.AllowNoAuth {
 		serverConfig.NoClientAuth = true
+		// 免认证也只放行存在的用户
+		serverConfig.NoClientAuthCallback = func(cm ssh.ConnMetadata) (*ssh.Permissions, error) {
+			if s.auth.UserAllowed(cm.User()) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("authentication failed")
+		}
 	}
 	serverConfig.AddHostKey(s.hostSigner)
 
