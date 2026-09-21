@@ -39,6 +39,7 @@ type Executor struct {
 type sessionState struct {
 	lastCode int
 	history  []string
+	user     Identity // 登录身份（SetUser 写入；零值表示未绑定，按 root 处理）
 }
 
 // execCtx 单次 Execute 的执行上下文：承载会话 ID、命令替换/子 shell 嵌套深度、
@@ -48,6 +49,7 @@ type execCtx struct {
 	depth     int
 	lastCode  int
 	pid       string
+	user      Identity // 当前执行身份：默认为会话登录用户，sudo 提权时为 root
 }
 
 // maxCmdSubstDepth 命令替换/子 shell 最大嵌套深度：防深嵌套展开耗尽栈与 CPU。
@@ -207,7 +209,13 @@ func (e *Executor) Execute(sessionID, cwd, raw string) (string, Result) {
 // executeDepth 带嵌套深度的执行入口：sudo 等内部重入通过 depth 复用
 // maxCmdSubstDepth 上限，防止 sudo sudo ... 无限递归耗尽栈与 CPU。
 func (e *Executor) executeDepth(sessionID, cwd, raw string, depth int) (string, Result) {
-	ctx := &execCtx{sessionID: sessionID, pid: sessionPid(sessionID), depth: depth}
+	return e.executeAs(sessionID, cwd, raw, depth, e.identityFor(sessionID))
+}
+
+// executeAs 以指定身份执行：sudo 传 root；bash -c / python -c 等嵌套执行沿用父 ctx 的身份，
+// 避免 `sudo bash -c id` 内层又退回登录用户。
+func (e *Executor) executeAs(sessionID, cwd, raw string, depth int, user Identity) (string, Result) {
+	ctx := &execCtx{sessionID: sessionID, pid: sessionPid(sessionID), depth: depth, user: user}
 	e.setCWD(sessionID, cwd)
 
 	start := time.Now()
@@ -332,7 +340,11 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	switch bin {
 	case "cd":
 		if len(rest) == 0 {
-			return cwd, 0, append(out, []byte(cwd+"\n")...)
+			// 无参数 cd 回到当前用户家目录（家目录不存在则原地不动）
+			if home := ctx.user.Home; e.fs.IsDir(home) {
+				return home, 0, out
+			}
+			return cwd, 0, out
 		}
 		target := rest[0]
 		if !strings.HasPrefix(target, "/") {
@@ -361,9 +373,9 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		}
 		return cwd, 0, append(out, []byte(e.hostname+"\n")...)
 	case "whoami":
-		return cwd, 0, append(out, []byte("root\n")...)
+		return cwd, 0, append(out, []byte(ctx.user.Name+"\n")...)
 	case "id":
-		return cwd, 0, append(out, []byte("uid=0(root) gid=0(root) groups=0(root)\n")...)
+		return cwd, 0, append(out, e.idCmd(ctx.user, rest)...)
 	case "date":
 		return cwd, 0, append(out, []byte(time.Now().Format("Mon Jan 02 15:04:05 UTC 2006")+"\n")...)
 	case "uname":
@@ -396,9 +408,9 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		}
 		return cwd, 0, out
 	case "ps":
-		return cwd, 0, append(out, e.ps(rest)...)
+		return cwd, 0, append(out, e.ps(ctx, rest)...)
 	case "who":
-		return cwd, 0, append(out, []byte("root     pts/0        "+time.Now().Format("2006-01-02 15:04")+" (10.0.2.15)\n")...)
+		return cwd, 0, append(out, whoLine(ctx.user)...)
 	case "top":
 		return cwd, 0, append(out, e.topCmd()...)
 	case "clear":
@@ -432,12 +444,12 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "grep", "egrep", "fgrep", "head", "tail", "wc", "sort", "uniq", "awk", "sed", "cut", "tr", "base64", "strings", "tee", "xargs", "sha256sum", "md5sum":
 		return cwd, 0, append(out, e.filterCmd(cwd, bin, rest)...)
 	case "env":
-		return cwd, 0, append(out, e.envCmd(cwd)...)
+		return cwd, 0, append(out, e.envCmd(ctx, cwd)...)
 	case "export":
 		// 仿真：export FOO=bar 静默成功（会话内保留留待后续增强）
 		return cwd, 0, out
 	case "set":
-		return cwd, 0, append(out, e.envCmd(cwd)...)
+		return cwd, 0, append(out, e.envCmd(ctx, cwd)...)
 	case "which":
 		return cwd, 0, append(out, e.whichCmd(rest)...)
 	case "uptime":
@@ -465,7 +477,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "lastlog":
 		return cwd, 0, append(out, []byte(lastlogText)...)
 	case "w":
-		return cwd, 0, append(out, e.wText()...)
+		return cwd, 0, append(out, wText(ctx.user)...)
 	case "kill", "jobs", "ln", "pkill", "killall":
 		// pkill/killall：仿真环境没有真实后台进程表可查，静默成功
 		// （与真实 pkill 默认无输出的行为一致）。
@@ -475,7 +487,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		// 对纯交互调用（无内联代码）的简化处理保持一致，见该函数注释。
 		return cwd, 0, out
 	case "crontab":
-		return cwd, 0, append(out, e.crontabCmd(cwd, rest)...)
+		return cwd, 0, append(out, e.crontabCmd(ctx, cwd, rest)...)
 	case "useradd", "adduser":
 		return cwd, 0, append(out, e.userAddCmd(bin, rest)...)
 	case "userdel":
@@ -483,7 +495,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "usermod":
 		return cwd, 0, append(out, e.usermodCmd(rest)...)
 	case "passwd":
-		return cwd, 0, append(out, e.passwdCmd(rest)...)
+		return cwd, 0, append(out, e.passwdCmd(ctx, rest)...)
 	case "systemctl", "service":
 		return cwd, 0, append(out, e.systemctlCmd(bin, rest)...)
 	case "iptables", "ip6tables":
@@ -493,7 +505,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "touch":
 		return cwd, 0, append(out, e.touchCmd(cwd, rest)...)
 	case "mkdir", "rmdir":
-		return cwd, 0, append(out, e.mkdirCmd(cwd, rest)...)
+		return cwd, 0, append(out, e.mkdirCmd(ctx, cwd, rest)...)
 	case "rm":
 		return cwd, 0, append(out, e.rmCmd(cwd, rest)...)
 	case "mv":
@@ -521,7 +533,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "make":
 		return cwd, 0, append(out, e.makeCmd(cwd)...)
 	case "git":
-		return cwd, 0, append(out, e.gitCmd(cwd, rest)...)
+		return cwd, 0, append(out, e.gitCmd(ctx, cwd, rest)...)
 	case "java":
 		return cwd, 0, append(out, e.javaCmd(cwd, rest)...)
 	case "rsync":
@@ -552,7 +564,7 @@ func (e *Executor) runInterpreter(ctx *execCtx, cwd, bin string, args []string, 
 	if ctx.depth >= maxCmdSubstDepth {
 		return cwd, 1, append(out, []byte(bin+": too many nested interpreter levels\n")...)
 	}
-	_, _ = e.executeDepth(ctx.sessionID, cwd, code, ctx.depth+1)
+	_, _ = e.executeAs(ctx.sessionID, cwd, code, ctx.depth+1, ctx.user)
 	return cwd, 0, out
 }
 
@@ -781,10 +793,11 @@ func (e *Executor) printf(args []string) []byte {
 // --- P1 高频侦察命令 ---
 
 // envCmd 输出标准环境（与 expandConfig 保持一致）
-func (e *Executor) envCmd(cwd string) []byte {
-	return []byte(fmt.Sprintf("HOME=/root\nHOSTNAME=%s\nLANG=en_US.UTF-8\nLOGNAME=root\n"+
+func (e *Executor) envCmd(ctx *execCtx, cwd string) []byte {
+	u := ctx.user
+	return []byte(fmt.Sprintf("HOME=%s\nHOSTNAME=%s\nLANG=en_US.UTF-8\nLOGNAME=%s\n"+
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nPWD=%s\n"+
-		"SHELL=/bin/bash\nTERM=xterm-256color\nUSER=root\n", e.hostname, cwd))
+		"SHELL=/bin/bash\nTERM=xterm-256color\nUSER=%s\n", u.Home, e.hostname, u.Name, cwd, u.Name))
 }
 
 // knownPaths 常见命令 → 可执行路径（仿真 which）
@@ -853,18 +866,18 @@ proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)
 tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev)
 `
 
-// sudoCmd 仿真 sudo：-l 列出权限；其余参数以 root 递归执行（有限递归，无死循环风险）
+// sudoCmd 仿真 sudo：-l 列出当前用户的权限；其余参数以 root 身份递归执行（有限递归，无死循环风险）
 func (e *Executor) sudoCmd(ctx *execCtx, cwd string, args []string) []byte {
 	if len(args) == 0 {
 		return []byte("usage: sudo [-D level] -h | -K | -k | -V\n")
 	}
 	if args[0] == "-l" || args[0] == "--list" {
-		return []byte(fmt.Sprintf(`Matching Defaults entries for root on %s:
+		return []byte(fmt.Sprintf(`Matching Defaults entries for %s on %s:
     env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin
 
-User root may run the following commands on %s:
+User %s may run the following commands on %s:
     (ALL : ALL) ALL
-`, e.hostname, e.hostname))
+`, ctx.user.Name, e.hostname, ctx.user.Name, e.hostname))
 	}
 	if args[0] == "-i" || args[0] == "-s" || args[0] == "-u" {
 		return nil
@@ -878,7 +891,7 @@ User root may run the following commands on %s:
 	if ctx.depth >= maxCmdSubstDepth {
 		return []byte("sudo: too many levels of nested sudo\n")
 	}
-	_, res := e.executeDepth(ctx.sessionID, cwd, sub, ctx.depth+1)
+	_, res := e.executeAs(ctx.sessionID, cwd, sub, ctx.depth+1, rootIdentity()) // sudo：以 root 执行
 	return res.Output
 }
 
@@ -985,7 +998,7 @@ func (e *Executor) touchCmd(cwd string, args []string) []byte {
 }
 
 // mkdirCmd 仿真 mkdir/rmdir
-func (e *Executor) mkdirCmd(cwd string, args []string) []byte {
+func (e *Executor) mkdirCmd(ctx *execCtx, cwd string, args []string) []byte {
 	parents := false
 	var targets []string
 	for _, a := range args {
@@ -1006,7 +1019,7 @@ func (e *Executor) mkdirCmd(cwd string, args []string) []byte {
 				continue
 			}
 		}
-		if err := e.fs.Mkdir(full, "drwxr-xr-x", "root", "root"); err != nil {
+		if err := e.fs.Mkdir(full, "drwxr-xr-x", ctx.user.Name, groupName(ctx.user)); err != nil {
 			fmt.Fprintf(&b, "mkdir: cannot create directory '%s': %s\n", t, err)
 		}
 	}
@@ -1576,7 +1589,7 @@ func (e *Executor) makeCmd(cwd string) []byte {
 // gitCmd 仿真常见 git 子命令：clone 会在 VFS 里真正建出目录，让后续 ls/cd 能
 // 继续走下去；status/log/pull 等在"当前目录不是仓库"这个（对我们的仿真环境
 // 而言几乎总是成立的）默认场景下给出与真实 git 一致的报错。
-func (e *Executor) gitCmd(cwd string, args []string) []byte {
+func (e *Executor) gitCmd(ctx *execCtx, cwd string, args []string) []byte {
 	if len(args) == 0 {
 		return []byte("usage: git [--version] [--help] <command> [<args>]\n")
 	}
@@ -1603,7 +1616,7 @@ func (e *Executor) gitCmd(cwd string, args []string) []byte {
 		dst := path.Join(cwd, name)
 		var b strings.Builder
 		fmt.Fprintf(&b, "Cloning into '%s'...\n", name)
-		if err := e.fs.Mkdir(dst, "drwxr-xr-x", "root", "root"); err != nil {
+		if err := e.fs.Mkdir(dst, "drwxr-xr-x", ctx.user.Name, groupName(ctx.user)); err != nil {
 			fmt.Fprintf(&b, "fatal: destination path '%s' already exists and is not an empty directory.\n", name)
 			return []byte(b.String())
 		}
@@ -1709,9 +1722,9 @@ func (e *Executor) rsyncCmd(cwd string, args []string) []byte {
 // 等，见 parse.go 的 isFilter），crontab 不在其中，`crontab -` 读不到管道里的
 // 内容。要支持需要把 isFilter 的范围扩大成"愿意消费 stdin 的命令"这个更通用的
 // 概念，这个改动会影响 curl|bash 这类更常见的场景，值得单独一次改动处理。
-func (e *Executor) crontabCmd(cwd string, args []string) []byte {
-	const user = "root"
-	const crontabPath = "/var/spool/cron/crontabs/" + user
+func (e *Executor) crontabCmd(ctx *execCtx, cwd string, args []string) []byte {
+	user := ctx.user.Name // 登录名已经过 SanitizeUsername，可安全拼进路径
+	crontabPath := "/var/spool/cron/crontabs/" + user
 
 	list, remove := false, false
 	var file string
@@ -1725,7 +1738,7 @@ func (e *Executor) crontabCmd(cwd string, args []string) []byte {
 		case a == "-e" || a == "--edit":
 			return nil // 无真实交互编辑器，静默成功（同 vi/nano）
 		case a == "-u" || a == "--user":
-			i++ // 跳过用户名参数值：本仿真只有 root 一个身份，忽略具体取值
+			i++ // 跳过用户名参数值：本仿真只操作当前用户自己的 crontab，忽略 -u 的取值
 		case strings.HasPrefix(a, "-"):
 			// 忽略其他选项
 		default:
@@ -1948,8 +1961,8 @@ func (e *Executor) usermodCmd(args []string) []byte {
 // shell 没有这套机制（同 vi/nano 的限制）。这里只检查用户是否存在，给出与
 // 真实工具一致的收尾提示；不真正改写 shadow 密码哈希——对可观测性没有影响，
 // 命令原文（含尝试设置的新密码，如果直接跟在参数里）已经被完整记录。
-func (e *Executor) passwdCmd(args []string) []byte {
-	name := "root"
+func (e *Executor) passwdCmd(ctx *execCtx, args []string) []byte {
+	name := ctx.user.Name // 不带用户名时改自己的密码
 	for _, a := range args {
 		if !strings.HasPrefix(a, "-") {
 			name = a
@@ -2137,14 +2150,6 @@ bin                                       **Never logged in**
 nobody                                    **Never logged in**
 `
 
-// wText 仿真 w
-func (e *Executor) wText() []byte {
-	return []byte(fmt.Sprintf(" %s up 7 days,  1 user,  load average: 0.00, 0.01, 0.05\n"+
-		"USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n"+
-		"root     pts/0    10.0.2.5         08:12    2.00s  0.05s  0.01s -bash\n",
-		time.Now().Format("15:04:05")))
-}
-
 // absPath 绝对化路径：绝对路径原样返回，相对路径拼接到 cwd
 func absPath(cwd, p string) string {
 	if strings.HasPrefix(p, "/") {
@@ -2233,15 +2238,9 @@ func globMatch(pattern, s string) bool {
 	return si == len(s)
 }
 
-func (e *Executor) ps(args []string) []byte {
+func (e *Executor) ps(ctx *execCtx, args []string) []byte {
 	if len(args) > 0 && (args[0] == "-ef" || args[0] == "-aux") {
-		return []byte(`UID          PID    PPID  C STIME TTY          TIME CMD
-root           1       0  0 00:00 ?        00:00:02 /sbin/init
-root         378       1  0 00:00 ?        00:00:00 /usr/sbin/sshd -D
-root         402     378  0 00:00 ?        00:00:00 sshd: root@pts/0
-root         403     402  0 00:00 pts/0    00:00:00 -bash
-root         410     403  0 00:00 pts/0    00:00:00 ps -ef
-`)
+		return psFull(ctx.user)
 	}
 	return []byte(`  PID TTY          TIME CMD
   402 pts/0    00:00:00 bash

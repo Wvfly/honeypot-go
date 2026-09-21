@@ -175,12 +175,14 @@ func (e *Executor) expandConfig(ctx *execCtx, cwd string) *expand.Config {
 	return &expand.Config{
 		Env: expand.FuncEnviron(func(name string) string {
 			switch name {
-			case "HOME": // 仿真 root 登录：家目录固定 /root，而非当前目录
-				return "/root"
+			case "HOME": // 当前登录用户的家目录（固定值，而非当前目录）
+				return ctx.user.Home
 			case "PWD":
 				return cwd
 			case "USER", "LOGNAME":
-				return "root"
+				return ctx.user.Name
+			case "UID", "EUID": // 脚本常用 [ $EUID -eq 0 ] 判断是否 root
+				return strconv.Itoa(ctx.user.UID)
 			case "SHELL":
 				return "/bin/bash"
 			case "HOSTNAME":

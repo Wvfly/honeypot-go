@@ -389,7 +389,7 @@ func (s *Server) handleSession(conn *ssh.ServerConn, connID string, ch ssh.Chann
 		if sess != nil {
 			return
 		}
-		sess = session.New(connID, chType, s.fs, s.exec, s.bus, s.logger)
+		sess = session.New(connID, chType, conn.User(), s.fs, s.exec, s.bus, s.logger)
 		// ttyrec 录制：含全部命令内容，目录/文件权限收紧
 		dir := filepath.Join(s.cfg.Storage.DataDir, "recordings")
 		if err := os.MkdirAll(dir, 0o700); err == nil {

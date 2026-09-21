@@ -23,6 +23,7 @@ type Session struct {
 	Cols    int
 	Rows    int
 
+	user    shell.Identity // 登录身份（SSH 认证用户名解析而来）
 	fs      *vfs.FileSystem
 	exec    *shell.Executor
 	bus     *event.Bus
@@ -33,9 +34,10 @@ type Session struct {
 	closed  bool
 }
 
-// New 创建会话（初始 cwd 为 /root，模拟 root 登录）
-func New(connID, channel string, fs *vfs.FileSystem, exec *shell.Executor, bus *event.Bus, logger *slog.Logger) *Session {
-	return &Session{
+// New 创建会话：以 SSH 认证时的用户名登录，初始 cwd 为该用户的家目录
+// （root 为 /root，其他用户如 /home/ubuntu；家目录不存在时与真实 sshd 一样落在 /）。
+func New(connID, channel, username string, fs *vfs.FileSystem, exec *shell.Executor, bus *event.Bus, logger *slog.Logger) *Session {
+	s := &Session{
 		ID:      ident.New("sess"),
 		ConnID:  connID,
 		Channel: channel,
@@ -43,10 +45,19 @@ func New(connID, channel string, fs *vfs.FileSystem, exec *shell.Executor, bus *
 		exec:    exec,
 		bus:     bus,
 		logger:  logger,
-		cwd:     "/root",
 		started: time.Now(),
 	}
+	// 身份存进执行器的会话状态，whoami/id/env/$HOME 等命令据此输出
+	s.user = exec.SetUser(s.ID, username)
+	s.cwd = "/"
+	if fs.IsDir(s.user.Home) {
+		s.cwd = s.user.Home
+	}
+	return s
 }
+
+// Username 返回登录用户名（已清洗）
+func (s *Session) Username() string { return s.user.Name }
 
 // Open 发布会话开启事件
 func (s *Session) Open() {
@@ -88,13 +99,24 @@ func (s *Session) RecordOutput(p []byte) {
 func (s *Session) Cwd() string { return s.cwd }
 
 // Prompt 生成 shell 提示符
+// 形如 root@host:~# 或 ubuntu@host:~/app$ ；家目录显示为 ~
 func (s *Session) Prompt() string {
-	host := s.fsHostname()
-	dir := s.cwd
-	if strings.HasPrefix(dir, "/root") {
-		dir = "~" + strings.TrimPrefix(dir, "/root")
+	return s.user.Name + "@" + s.fsHostname() + ":" + s.promptDir() + s.user.PromptChar() + " "
+}
+
+// promptDir 把家目录缩写为 ~（按路径边界匹配，/rootfoo 不会被误缩写）
+func (s *Session) promptDir() string {
+	home, dir := s.user.Home, s.cwd
+	if home == "" || home == "/" {
+		return dir
 	}
-	return "root@" + host + ":" + dir + "# "
+	if dir == home {
+		return "~"
+	}
+	if strings.HasPrefix(dir, home+"/") {
+		return "~" + dir[len(home):]
+	}
+	return dir
 }
 
 // ExecuteLine 执行一行交互命令，返回输出
