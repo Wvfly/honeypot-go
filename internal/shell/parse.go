@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"honeypot-go/internal/event"
+	"honeypot-go/internal/vfs"
 )
 
 // M2: 基于 mvdan.cc/sh 的完整 shell 语法解析。
@@ -154,11 +156,16 @@ func (e *Executor) runCall(ctx *execCtx, cwd string, call *syntax.CallExpr, redi
 		}
 		added := out[prefix:]
 		out = out[:prefix]
+		var werr error
 		switch r.Op {
 		case syntax.AppOut: // >>
-			_ = e.fs.AppendFile(path, added)
+			werr = e.fs.AppendFile(path, added)
 		default: // > 及其他输出重定向
-			_ = e.fs.WriteFile(path, added)
+			werr = e.fs.WriteFile(path, added)
+		}
+		// 目标带 chattr +i / +a 时和真实 bash 一样报错；其他写入失败保持原有的静默行为
+		if errors.Is(werr, vfs.ErrNotPermitted) {
+			out = append(out, []byte("bash: "+target+": Operation not permitted\n")...)
 		}
 		e.publishFileWritten(ctx, path, added)
 	}

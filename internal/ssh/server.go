@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -550,19 +551,27 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 	histIdx := -1  // -1 = 未在历史导航中
 	var esc []byte // ANSI 转义序列缓冲
 
-	// redraw 重绘整行（清除 → 输出 → 光标回退），行内编辑统一走此函数保证终端与录制一致
+	// emit 同时写到终端与 ttyrec 录制
+	emit := func(p []byte) {
+		_, _ = ch.Write(p)
+		sess.RecordOutput(p)
+	}
+
+	// redraw 重绘整行：回到行首 → 清行 → 重印提示符和输入 → 光标回退到 cursor 处。
+	// 行内编辑统一走此函数保证终端与录制一致。
+	// 注意必须把提示符一起重印：\r\x1b[K 会把提示符也擦掉，只印 line 的话
+	// 退格/Del/方向键之后提示符会消失，回车后新提示符就落到"下一行"，看上去像被分行。
+	// 提示符每次现取：cd 之后其中的目录会变。
 	redraw := func() {
-		_, _ = ch.Write([]byte("\r\x1b[K"))
-		sess.RecordOutput([]byte("\r\x1b[K"))
-		if len(line) > 0 {
-			_, _ = ch.Write(line)
-			sess.RecordOutput(line)
+		if cursor > len(line) { // 防御：cursor 不应越界，越界时收敛到行尾而不是 panic
+			cursor = len(line)
 		}
-		if n := len(line) - cursor; n > 0 {
-			mv := []byte(fmt.Sprintf("\x1b[%dD", n))
-			_, _ = ch.Write(mv)
-			sess.RecordOutput(mv)
+		buf := append([]byte("\r\x1b[K"), sess.Prompt()...)
+		buf = append(buf, line...)
+		if n := utf8.RuneCount(line[cursor:]); n > 0 {
+			buf = append(buf, fmt.Sprintf("\x1b[%dD", n)...)
 		}
+		emit(buf)
 	}
 
 	// insertAt 在光标处插入字节（行尾直接追加；行中需重绘）
@@ -589,9 +598,25 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 		if cursor <= 0 {
 			return
 		}
-		copy(line[cursor-1:], line[cursor:])
-		line = line[:len(line)-1]
-		cursor--
+		// 快路径（最常见：在行尾删一个 ASCII 字符）：退格-空格-退格，和真实终端一致，
+		// 不重绘整行。仅当整行（含被删字符）都在第一行且没顶到最右列时使用——
+		// 顶到最右列时终端处于"待换行"状态，\b 的行为各终端不一致，退回整行重绘。
+		cols := sess.Cols
+		if cols <= 0 {
+			cols = 80
+		}
+		if cursor == len(line) && line[cursor-1] < 0x80 &&
+			utf8.RuneCountInString(sess.Prompt())+len(line) < cols {
+			line = line[:len(line)-1]
+			cursor--
+			emit([]byte("\b \b"))
+			return
+		}
+		// 整个 UTF-8 字符一起删，不能只删一个字节
+		_, size := utf8.DecodeLastRune(line[:cursor])
+		copy(line[cursor-size:], line[cursor:])
+		line = line[:len(line)-size]
+		cursor -= size
 		redraw()
 	}
 
@@ -605,25 +630,31 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 	}
 
 	// navHistory 上下键历史导航
+	var saved []byte // 开始翻历史前正在编辑的那一行，翻回最新一条之后恢复（与 bash 一致）
 	navHistory := func(up bool) {
 		hist := sess.History()
 		if up {
 			if len(hist) == 0 {
 				return
 			}
+			if histIdx == -1 {
+				saved = append(saved[:0], line...)
+			}
 			if histIdx < len(hist)-1 {
 				histIdx++
 			}
 			line = append(line[:0], hist[len(hist)-1-histIdx]...)
 		} else {
-			if histIdx <= 0 {
-				histIdx = -1
-				line = line[:0]
-				redraw()
+			if histIdx < 0 { // 没在翻历史：↓ 什么都不做，不能把正在输入的内容清掉
 				return
 			}
-			histIdx--
-			line = append(line[:0], hist[len(hist)-1-histIdx]...)
+			if histIdx == 0 {
+				histIdx = -1
+				line = append(line[:0], saved...)
+			} else {
+				histIdx--
+				line = append(line[:0], hist[len(hist)-1-histIdx]...)
+			}
 		}
 		cursor = len(line)
 		redraw()
@@ -687,16 +718,16 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 				sess.RecordOutput([]byte("\x1b[D"))
 			}
 		case "\x1b[H", "\x1b[1~": // Home
+			// 不能直接发 \x1b[H：那是"光标移到屏幕左上角"，不是"行首"。重绘并定位光标即可。
 			if cursor > 0 {
 				cursor = 0
-				_, _ = ch.Write([]byte("\x1b[H"))
-				sess.RecordOutput([]byte("\x1b[H"))
+				redraw()
 			}
 		case "\x1b[F", "\x1b[4~": // End
+			// 同上，\x1b[F 是"上一行行首"，不是"行尾"
 			if cursor < len(line) {
 				cursor = len(line)
-				_, _ = ch.Write([]byte("\x1b[F"))
-				sess.RecordOutput([]byte("\x1b[F"))
+				redraw()
 			}
 		case "\x1b[3~": // Del
 			del()
@@ -712,15 +743,29 @@ func (s *Server) runInteractiveShell(ch ssh.Channel, sess *session.Session, refr
 		for i := 0; i < len(data); i++ {
 			b := data[i]
 			if len(esc) > 0 {
-				// 已在转义序列中：收集到 CSI 终止字节（0x40~0x7E）
 				if len(esc) >= maxEscLen {
 					esc = esc[:0]
 					continue
 				}
 				esc = append(esc, b)
-				if b >= 0x40 && b <= 0x7E {
-					handleEsc(esc)
+				switch {
+				case len(esc) == 2:
+					// ESC 后必须紧跟 '['（CSI）或 'O'（SS3，应用光标模式）；
+					// 其他（如 Alt+键）直接丢弃。注意 '[' 本身在 0x40~0x7E 范围内，
+					// 不能把它当作序列终止字节，否则 ↑↓←→ 会变成字母 A/B/C/D 被输入。
+					if b != '[' && b != 'O' {
+						esc = esc[:0]
+					}
+				case esc[1] == 'O':
+					// SS3：ESC O A/B/C/D/H/F，等价于对应的 CSI 序列
+					handleEsc([]byte{0x1b, '[', b})
 					esc = esc[:0]
+				default:
+					// CSI：收集到终止字节（0x40~0x7E）
+					if b >= 0x40 && b <= 0x7E {
+						handleEsc(esc)
+						esc = esc[:0]
+					}
 				}
 				continue
 			}

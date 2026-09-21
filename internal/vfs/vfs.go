@@ -6,6 +6,7 @@ import (
 	fsys "io/fs"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type node struct {
 	mtime    time.Time
 	content  []byte
 	children map[string]*node
+	attrs    uint32 // chattr/lsattr 属性位（不含默认的 e），见 attr.go
 }
 
 // 全局容量预算：防攻击者通过 touch/mkdir/wget/echo 无限创建节点与内容，
@@ -476,6 +478,10 @@ func (fs *FileSystem) lockedWrite(path string, data []byte, appendMode bool) err
 	}
 	n, exists := dir.children[name]
 	if !exists {
+		// 父目录带 i 属性：不能新增条目（root 也不行）
+		if dir.immutable() {
+			return ErrNotPermitted
+		}
 		// 新建文件：全局节点数预算检查
 		if fs.totalNodes >= maxTotalNodes {
 			return fmt.Errorf("filesystem node limit reached (%d)", maxTotalNodes)
@@ -485,6 +491,9 @@ func (fs *FileSystem) lockedWrite(path string, data []byte, appendMode bool) err
 		fs.totalNodes++
 	} else if n.isDir {
 		return fmt.Errorf("is a directory")
+	} else if n.immutable() || (n.attrs&AttrAppendOnly != 0 && !appendMode) {
+		// i：任何写入都拒绝；a：只允许追加（>> 可以，> 截断不行）
+		return ErrNotPermitted
 	} else if !permWritable(n.perm) {
 		// 已存在文件：owner 无写位则拒绝覆盖，防止篡改只读系统文件污染环境
 		return fmt.Errorf("permission denied: file %q is read-only", path)
@@ -584,6 +593,9 @@ func (fs *FileSystem) Mkdir(p, perm, owner, group string) error {
 		if _, ok := dir.children[seg]; ok {
 			return fmt.Errorf("cannot create directory %q: File exists", seg)
 		}
+		if dir.immutable() {
+			return ErrNotPermitted
+		}
 		if !permWritable(dir.perm) {
 			return fmt.Errorf("permission denied: directory %q is read-only", dir.name)
 		}
@@ -615,6 +627,10 @@ func (fs *FileSystem) Remove(p string) error {
 	if !exists {
 		return fmt.Errorf("no such file or directory")
 	}
+	// 目标或其父目录带 i/a：不能删除（root 也不行）
+	if n.protected() || parent.protected() {
+		return ErrNotPermitted
+	}
 	if n.isDir && len(n.children) > 0 {
 		return fmt.Errorf("directory not empty")
 	}
@@ -640,6 +656,10 @@ func (fs *FileSystem) RemoveAll(p string) error {
 	n, exists := parent.children[name]
 	if !exists {
 		return fmt.Errorf("no such file or directory")
+	}
+	// 子树里只要有带 i/a 的节点就整体拒绝（简化：真实 rm -rf 会删掉其余部分）
+	if parent.protected() || subtreeProtected(n) {
+		return ErrNotPermitted
 	}
 	if !permWritable(parent.perm) {
 		return fmt.Errorf("permission denied: directory %q is read-only", parent.name)
@@ -667,6 +687,9 @@ func (fs *FileSystem) Rename(oldPath, newPath string) error {
 	if !ok {
 		return fmt.Errorf("no such file or directory")
 	}
+	if src.protected() || srcParent.protected() || dstParent.immutable() {
+		return ErrNotPermitted
+	}
 	if !permWritable(srcParent.perm) || !permWritable(dstParent.perm) {
 		return fmt.Errorf("permission denied")
 	}
@@ -690,6 +713,9 @@ func (fs *FileSystem) Copy(srcPath, dstPath string) error {
 	dstParent, dstName, ok := fs.locateNode(dstPath)
 	if !ok {
 		return fmt.Errorf("no such file or directory")
+	}
+	if dstParent.immutable() {
+		return ErrNotPermitted
 	}
 	if !permWritable(dstParent.perm) {
 		return fmt.Errorf("permission denied: directory %q is read-only", dstParent.name)
@@ -729,6 +755,9 @@ func (fs *FileSystem) Chmod(p, perm string) error {
 	if !ok {
 		return fmt.Errorf("no such file or directory")
 	}
+	if n.immutable() {
+		return ErrNotPermitted
+	}
 	if len(perm) < 9 {
 		return fmt.Errorf("invalid mode")
 	}
@@ -743,6 +772,9 @@ func (fs *FileSystem) Chown(p, owner, group string) error {
 	n, ok := fs.resolve(p)
 	if !ok {
 		return fmt.Errorf("no such file or directory")
+	}
+	if n.immutable() {
+		return ErrNotPermitted
 	}
 	if owner != "" {
 		n.owner = owner
@@ -760,6 +792,9 @@ func (fs *FileSystem) Touch(p string) error {
 	if n, ok := fs.resolve(p); ok {
 		if n.isDir {
 			return fmt.Errorf("is a directory")
+		}
+		if n.immutable() {
+			return ErrNotPermitted
 		}
 		n.mtime = time.Now()
 		return nil
@@ -855,14 +890,16 @@ func (fs *FileSystem) procContent(path string) []byte {
 	case "/proc/meminfo":
 		return []byte("MemTotal:       16383952 kB\nMemFree:         4123456 kB\nMemAvailable:   11472544 kB\n")
 	case "/proc/uptime":
-		return []byte("1234567.89 9876543.21\n")
+		// 与 uptime/w/top 同源（见 attr.go 的 bootTime）；单核，空闲时间略小于运行时间
+		up := Uptime().Seconds()
+		return []byte(fmt.Sprintf("%.2f %.2f\n", up, up*0.97))
 	case "/proc/loadavg":
 		return []byte("0.00 0.01 0.05 1/312 403\n")
 	case "/proc/stat":
 		return []byte("cpu  123456 789 65432 987654321 1234 0 5678 0 0 0\n" +
 			"cpu0 123456 789 65432 987654321 1234 0 5678 0 0 0\n" +
 			"intr 234567890 45 89 0 0 0 0 0 0 0\n" +
-			"ctxt 1234567890\nbtime 1700000000\nprocesses 5432\nprocs_running 1\nprocs_blocked 0\n")
+			"ctxt 1234567890\nbtime " + strconv.FormatInt(bootTime.Unix(), 10) + "\nprocesses 5432\nprocs_running 1\nprocs_blocked 0\n")
 	case "/proc/self/status":
 		// PID 与 ps 输出联动（bash pid=403, sshd@pts/0 pid=402）
 		return []byte("Name:\tbash\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t403\nNgid:\t0\nPid:\t403\nPPid:\t402\n" +

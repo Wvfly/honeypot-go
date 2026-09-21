@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"honeypot-go/internal/vfs"
 )
 
 // Identity 会话的登录身份：SSH 认证时的用户名 + VFS /etc/passwd 里对应的条目。
@@ -233,8 +235,8 @@ func whoLine(user Identity) []byte {
 
 // wText 仿真 w：当前会话所属用户
 func wText(user Identity) []byte {
-	return []byte(fmt.Sprintf(" %s up 7 days,  1 user,  load average: 0.00, 0.01, 0.05\n"+
+	return []byte(fmt.Sprintf(" %s\n"+
 		"USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n"+
 		"%-8s pts/0    10.0.2.5         08:12    2.00s  0.05s  0.01s -bash\n",
-		time.Now().Format("15:04:05"), user.Name))
+		uptimeHeader(time.Now(), vfs.Uptime()), user.Name))
 }

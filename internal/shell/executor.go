@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -453,7 +454,7 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 	case "which":
 		return cwd, 0, append(out, e.whichCmd(rest)...)
 	case "uptime":
-		return cwd, 0, append(out, e.uptimeCmd()...)
+		return cwd, 0, append(out, e.uptimeCmd(rest)...)
 	case "free":
 		return cwd, 0, append(out, []byte(freeText)...)
 	case "df":
@@ -486,6 +487,12 @@ func (e *Executor) execOne(ctx *execCtx, cwd string, args []string, out []byte) 
 		// 无真实全屏/模态编辑器或终端复用器，静默返回——与 runInterpreter
 		// 对纯交互调用（无内联代码）的简化处理保持一致，见该函数注释。
 		return cwd, 0, out
+	case "chattr":
+		o, c := e.chattrCmd(ctx, cwd, rest)
+		return cwd, c, append(out, o...)
+	case "lsattr":
+		o, c := e.lsattrCmd(cwd, rest)
+		return cwd, c, append(out, o...)
 	case "crontab":
 		return cwd, 0, append(out, e.crontabCmd(ctx, cwd, rest)...)
 	case "useradd", "adduser":
@@ -813,7 +820,7 @@ var knownPaths = map[string]string{
 	"apt-get": "/usr/bin/apt-get", "yum": "/usr/bin/yum", "dnf": "/usr/bin/dnf",
 	"gzip": "/bin/gzip", "gunzip": "/bin/gunzip", "make": "/usr/bin/make",
 	"git": "/usr/bin/git", "java": "/usr/bin/java", "rsync": "/usr/bin/rsync",
-	"top":     "/usr/bin/top",
+	"top": "/usr/bin/top", "chattr": "/usr/bin/chattr", "lsattr": "/usr/bin/lsattr", "uptime": "/usr/bin/uptime",
 	"crontab": "/usr/bin/crontab", "useradd": "/usr/sbin/useradd", "adduser": "/usr/sbin/adduser",
 	"userdel": "/usr/sbin/userdel", "usermod": "/usr/sbin/usermod", "passwd": "/usr/bin/passwd",
 	"systemctl": "/usr/bin/systemctl", "service": "/usr/sbin/service",
@@ -838,12 +845,6 @@ func (e *Executor) whichCmd(args []string) []byte {
 		return nil
 	}
 	return []byte(b.String())
-}
-
-// uptimeCmd 仿真 uptime（系统运行 7 天）
-func (e *Executor) uptimeCmd() []byte {
-	now := time.Now()
-	return []byte(fmt.Sprintf(" %s up 7 days,  1 user,  load average: 0.00, 0.01, 0.05\n", now.Format("15:04:05")))
 }
 
 // freeText 仿真 free（16GB 内存主机）
@@ -991,7 +992,11 @@ func (e *Executor) touchCmd(cwd string, args []string) []byte {
 	for _, t := range targets {
 		full := absPath(cwd, t)
 		if err := e.fs.Touch(full); err != nil {
-			fmt.Fprintf(&b, "touch: cannot touch '%s': %s\n", t, err)
+			if _, exists := e.fs.Resolve(full); exists && errors.Is(err, vfs.ErrNotPermitted) {
+				fmt.Fprintf(&b, "touch: setting times of '%s': %s\n", t, err)
+			} else {
+				fmt.Fprintf(&b, "touch: cannot touch '%s': %s\n", t, err)
+			}
 		}
 	}
 	return []byte(b.String())
@@ -1050,7 +1055,8 @@ func (e *Executor) rmCmd(cwd string, args []string) []byte {
 		} else {
 			err = e.fs.Remove(full)
 		}
-		if err != nil && !force {
+		// -f 只忽略"文件不存在"；权限类错误（如 chattr +i 的 Operation not permitted）照常报
+		if err != nil && (!force || errors.Is(err, vfs.ErrNotPermitted)) {
 			fmt.Fprintf(&b, "rm: cannot remove '%s': %s\n", t, err)
 		}
 	}
@@ -1115,7 +1121,11 @@ func (e *Executor) cpCmd(cwd string, args []string) []byte {
 			target = path.Join(dstFull, path.Base(s))
 		}
 		if err := e.fs.Copy(srcFull, target); err != nil {
-			fmt.Fprintf(&b, "cp: cannot stat '%s': %s\n", s, err)
+			if errors.Is(err, vfs.ErrNotPermitted) {
+				fmt.Fprintf(&b, "cp: cannot create regular file '%s': %s\n", dst, err)
+			} else {
+				fmt.Fprintf(&b, "cp: cannot stat '%s': %s\n", s, err)
+			}
 		}
 	}
 	return []byte(b.String())
@@ -1149,7 +1159,11 @@ func (e *Executor) chmodCmd(cwd string, args []string) []byte {
 			continue
 		}
 		if err := e.fs.Chmod(full, perm); err != nil {
-			fmt.Fprintf(&b, "chmod: cannot access '%s': %s\n", t, err)
+			if errors.Is(err, vfs.ErrNotPermitted) {
+				fmt.Fprintf(&b, "chmod: changing permissions of '%s': %s\n", t, err)
+			} else {
+				fmt.Fprintf(&b, "chmod: cannot access '%s': %s\n", t, err)
+			}
 		}
 	}
 	return []byte(b.String())
@@ -1172,7 +1186,11 @@ func (e *Executor) chownCmd(cwd string, args []string) []byte {
 		}
 		full := absPath(cwd, t)
 		if err := e.fs.Chown(full, owner, group); err != nil {
-			fmt.Fprintf(&b, "chown: cannot access '%s': %s\n", t, err)
+			if errors.Is(err, vfs.ErrNotPermitted) {
+				fmt.Fprintf(&b, "chown: changing ownership of '%s': %s\n", t, err)
+			} else {
+				fmt.Fprintf(&b, "chown: cannot access '%s': %s\n", t, err)
+			}
 		}
 	}
 	return []byte(b.String())
@@ -1319,7 +1337,7 @@ func (e *Executor) duCmd(cwd string, args []string) []byte {
 // 数值与 uptimeCmd/freeText 保持一致，避免同一台"机器"的负载/内存数字互相矛盾。
 func (e *Executor) topCmd() []byte {
 	now := time.Now()
-	return []byte(fmt.Sprintf(`top - %s up 7 days,  1 user,  load average: 0.00, 0.01, 0.05
+	return []byte(fmt.Sprintf(`top - %s
 Tasks:  92 total,   1 running,  91 sleeping,   0 stopped,   0 zombie
 %%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.3 id,  0.1 wa,  0.0 hi,  0.1 si,  0.0 st
 MiB Mem :  15962.5 total,   8471.0 free,   4460.9 used,   3030.7 buff/cache
@@ -1331,7 +1349,7 @@ MiB Swap:   2048.0 total,   2048.0 free,      0.0 used.  10377.2 avail Mem
     402 root      20   0   14232   6720   5760 S   0.0   0.0   0:00.05 sshd
     403 root      20   0    9124   5340   4544 S   0.0   0.0   0:00.08 bash
     420 root      20   0    9328   5560   4544 R   0.3   0.0   0:00.01 top
-`, now.Format("15:04:05")))
+`, uptimeHeader(now, vfs.Uptime())))
 }
 
 // stripArchiveExt 去掉常见归档/压缩扩展名，得到 tar 解包后"看起来应该在的"条目名
