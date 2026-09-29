@@ -154,6 +154,7 @@ data/
 | `cmd/dbquery` | Print all 5 tables (connections/attempts/sessions/commands/extended events)              | `go run ./cmd/dbquery` |
 | `cmd/ttyshow` | Replay ttyrec recordings as timestamped text                                             | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
 | `cmd/anti_attack` | SSH anti attack: listen & bounce traffic back to the client's source IP on the same port | `go run ./cmd/anti_attack -port 22 -log logs/anti_attack.log` |
+| `cmd/report` | Web activity dashboard: read-only DB + HTTP server, view stats/charts in a browser | `go run ./cmd/report -listen 127.0.0.1:8080` |
 | SQLite join | Correlate all behavior per attacker IP                                                   | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
 > `auth_attempts` stores the **plaintext password** of every attempt; `commands` stores exit code / duration / output preview per command; the generic `events` table carries extended events (download / connect / file write / alert) with JSON payload.
@@ -179,6 +180,7 @@ Outputs go to `target/`:
 | `target/ttyshow-windows-amd64.exe` | ttyrec replay        |
 | `target/dbquery-windows-amd64.exe` | event query          |
 | `target/anti_attack-windows-amd64.exe` | SSH anti attack      |
+| `target/report-windows-amd64.exe` | Web activity dashboard |
 
 The script verifies the first 2 bytes are `MZ` (PE magic).
 
@@ -189,7 +191,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # am
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-Outputs go to `target/`: `honeypot-linux-amd64`, `ttyshow-linux-amd64`, `dbquery-linux-amd64`, `anti_attack-linux-amd64` (arm64 similarly). The script verifies the first 4 bytes are `7F 45 4C 46` (ELF magic) to prevent accidentally shipping a Windows PE.
+Outputs go to `target/`: `honeypot-linux-amd64`, `ttyshow-linux-amd64`, `dbquery-linux-amd64`, `anti_attack-linux-amd64`, `report-linux-amd64` (arm64 similarly). The script verifies the first 4 bytes are `7F 45 4C 46` (ELF magic) to prevent accidentally shipping a Windows PE.
 
 > On a Linux build host you don't need the script — just `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot`. The scripts are mainly for Windows devs cross-compiling to a Linux deploy target.
 
@@ -236,6 +238,75 @@ If you'd rather avoid granting capabilities, point `-port` at a high port (e.g. 
 ```
 
 The parent prints the child's PID and exits; the child lives on in a new session detached from the terminal (stdin/stdout/stderr go to `/dev/null`). The PID is written to `logs/anti_attack.pid` by default — override with `-pidfile <path>`. On Windows, use `nssm` or `sc.exe CreateService` to register it as a service.
+
+---
+
+## report: Web Activity Dashboard
+
+`cmd/report` is a **standalone-deployable** HTTP service: it opens the SQLite database written by the honeypot in **read-only** mode and renders aggregate statistics into a web dashboard (overview cards, daily connection/alert trends, Top source IPs / usernames / passwords / commands / download URLs, alert severity distribution, recent alert details). It never writes to the DB and doesn't require stopping the running honeypot; it can be deployed on the same host or a different one (as long as it can read that `.db` file). Aggregation and rendering live in the `internal/report` package.
+
+![Honeypot activity dashboard](docs/images/report-dashboard.jpeg)
+
+**Usage**
+
+```bash
+# Start the dashboard, open http://127.0.0.1:8080/ in a browser
+./report-linux-amd64 -db data/honeypot.db -listen 127.0.0.1:8080
+
+# No server: export a one-off static HTML (offline archive / email attachment)
+./report-linux-amd64 -db data/honeypot.db -once -out weekly.html -since 168h
+```
+
+**Flags**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-db` | `data/honeypot.db` | SQLite database path (opened read-only; can share the file with a running honeypot) |
+| `-listen` | `127.0.0.1:8080` | HTTP listen address; add firewall / reverse-proxy auth before exposing |
+| `-refresh` | `30s` | Dashboard auto-refresh interval (also the report cache TTL); `0` disables auto-refresh |
+| `-top` | `10` | Default entries per Top list; override per request with `?top=` (max 100) |
+| `-once` | `false` | Don't start the HTTP server; generate a one-off static HTML and exit |
+| `-out` | `report_<timestamp>.html` | With `-once`: output HTML file path |
+| `-since` | unlimited | With `-once`: only aggregate this recent window, e.g. `24h`, `168h` |
+| `-from` / `-to` | unlimited | With `-once`: range start (inclusive) / end (exclusive), format `2006-01-02` or full timestamp |
+
+**HTTP endpoints & query params**
+
+| Route | Description |
+|---|---|
+| `GET /` | HTML dashboard page |
+| `GET /report` | The same report data as JSON (for downstream integration) |
+| `GET /healthz` | Liveness probe, returns `ok` |
+
+Query params (shared by `/` and `/report`): `?since=168h` or `?from=2026-09-01&to=2026-09-08` (mutually exclusive) set the time range; `?top=20` adjusts Top list size. The page header offers quick switches for 24h / 7d / 30d / all. Invalid params return `400`.
+
+> The dashboard opens the DB read-only (DSN carries `mode=ro`) and validates the `connections` table exists at startup — a wrong path or missing file fails fast instead of silently creating an empty DB. Report results are cached per time range with TTL equal to `-refresh`, so frequent refreshes don't repeatedly scan disk.
+
+**Deployment (systemd)**
+
+The dashboard typically runs on the same host as the honeypot, pointing at the same `data/honeypot.db`:
+
+```ini
+# /etc/systemd/system/honeypot-report.service
+[Unit]
+Description=Honeypot Web Report Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=honeypot
+WorkingDirectory=/opt/honeypot
+ExecStart=/opt/honeypot/report-linux-amd64 -db /opt/honeypot/data/honeypot.db -listen 127.0.0.1:8080
+Restart=always
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/honeypot/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+It binds to `127.0.0.1` by default. To access from other machines, put Nginx/Caddy in front with an auth layer (basic auth / mTLS) rather than setting `-listen` to `0.0.0.0` and exposing it raw — the dashboard shows sensitive data such as attacker-submitted plaintext passwords.
 
 ---
 
@@ -335,6 +406,7 @@ honeypot-go/
 │   ├── honeypot/        # entry: wiring, graceful shutdown
 │   ├── smoketest/       # smoke test client
 │   ├── dbquery/         # SQLite ops query
+│   ├── report/          # Web activity dashboard: read-only DB + HTTP server
 │   ├── ttyshow/         # ttyrec replay
 │   └── anti_attack/     # TCP reverse proxy: bounce traffic back to client's source IP on the same port
 ├── internal/
@@ -349,6 +421,7 @@ honeypot-go/
 │   ├── vnet/            # virtual network emulation (wget/curl/ping/nc)
 │   ├── detect/          # rule engine + risk scoring + Webhook alerts
 │   ├── tty/             # ttyrec recording
+│   ├── report/          # report aggregation (SQL) + HTML/JSON rendering for cmd/report
 │   └── store/           # SQLite + JSONL persistence
 ├── configs/honeypot.yaml
 ├── scripts/             # build scripts (build-win.ps1 / build-linux.ps1) / smoke test

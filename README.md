@@ -154,6 +154,7 @@ data/
 | `cmd/dbquery` | 打印全部 5 张表（连接/爆破/会话/命令/扩展事件）      | `go run ./cmd/dbquery` |
 | `cmd/ttyshow` | 回放 ttyrec 录制为带时间戳文本              | `go run ./cmd/ttyshow data/recordings/*.ttyrec` |
 | `cmd/anti_attack` | SSH攻击反制：监听端口并把流量反弹回客户端源 IP 的同一端口 | `go run ./cmd/anti_attack -port 22 -log logs/anti_attack.log` |
+| `cmd/report` | Web 活动看板：只读数据库起 HTTP 服务，浏览器查看统计图表 | `go run ./cmd/report -listen 127.0.0.1:8080` |
 | SQLite 关联查询 | 按 IP 关联攻击者全部行为                   | `sqlite3 data/honeypot.db "SELECT c.source_ip, a.username, a.password FROM auth_attempts a JOIN connections c ON a.connection_id = c.id;"` |
 
 > `auth_attempts` 记录每次爆破的**密码原文**；`commands` 记录每条命令的 exit code / 耗时 / 输出摘要；`events` 通用表承载扩展事件（下载/连接/文件写入/告警），payload 为 JSON。
@@ -179,6 +180,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-win.ps1 -Arch arm64  # AR
 | `target/ttyshow-windows-amd64.exe` | ttyrec 回放 |
 | `target/dbquery-windows-amd64.exe` | 事件查询      |
 | `target/anti_attack-windows-amd64.exe` | ssh攻击反制   |
+| `target/report-windows-amd64.exe` | Web 活动看板   |
 
 脚本校验产物前 2 字节为 `MZ`（PE 魔数）。
 
@@ -189,7 +191,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1            # am
 powershell -ExecutionPolicy Bypass -File scripts\build-linux.ps1 -Arch arm64 # ARM64
 ```
 
-产物落在 `target/`：`honeypot-linux-amd64`、`ttyshow-linux-amd64`、`dbquery-linux-amd64`、`anti_attack-linux-amd64`（arm64 同理）。脚本校验产物前 4 字节为 `7F 45 4C 46`（ELF 魔数），可防止误编出 Windows PE。
+产物落在 `target/`：`honeypot-linux-amd64`、`ttyshow-linux-amd64`、`dbquery-linux-amd64`、`anti_attack-linux-amd64`、`report-linux-amd64`（arm64 同理）。脚本校验产物前 4 字节为 `7F 45 4C 46`（ELF 魔数），可防止误编出 Windows PE。
 
 > 在 Linux 主机上本机编译不必用脚本，直接 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o honeypot ./cmd/honeypot` 即可。脚本主要给 Windows 开发者交叉编译到 Linux 部署机使用。
 
@@ -236,6 +238,75 @@ anti_attack.exe -port 22 -log logs/anti_attack.log -log-level info
 ```
 
 父进程打印子 PID 后退出，子进程在新会话里独立运行（日志走文件，stdin/stdout/stderr 接到 `/dev/null`）。PID 默认写到 `logs/anti_attack.pid`，可用 `-pidfile <path>` 自定义。Windows 想后台请用 `nssm` 或 `sc.exe CreateService`。
+
+---
+
+## report：Web 活动看板
+
+`cmd/report` 是一个**可独立部署**的 HTTP 服务：以**只读**方式打开蜜罐写出的 SQLite 库文件，把聚合统计渲染成网页看板（概览卡片、每日连接/告警趋势、Top 来源 IP / 用户名 / 密码 / 命令 / 下载 URL、告警级别分布、最近告警明细）。它不写库、不需要停掉正在运行的蜜罐，可与主程序同机或异机部署（只要能读到那个 `.db` 文件）。聚合与渲染逻辑在 `internal/report` 包。
+
+![蜜罐活动看板界面](docs/images/report-dashboard.jpeg)
+
+**用法**
+
+```bash
+# 起看板服务，浏览器打开 http://127.0.0.1:8080/
+./report-linux-amd64 -db data/honeypot.db -listen 127.0.0.1:8080
+
+# 不起服务，导出一次静态 HTML（离线归档/邮件附件）
+./report-linux-amd64 -db data/honeypot.db -once -out weekly.html -since 168h
+```
+
+**flag**
+
+| flag | 默认 | 含义 |
+|---|---|---|
+| `-db` | `data/honeypot.db` | SQLite 数据库路径（只读打开，可与运行中的蜜罐共用同一文件） |
+| `-listen` | `127.0.0.1:8080` | HTTP 监听地址；对外暴露请自行加防火墙/反向代理鉴权 |
+| `-refresh` | `30s` | 看板自动刷新间隔（同时作为报表缓存 TTL），`0` 表示关闭自动刷新 |
+| `-top` | `10` | 各类 Top 列表默认条数；请求可用 `?top=` 覆盖（上限 100） |
+| `-once` | `false` | 不起 HTTP 服务，生成一次静态 HTML 后退出 |
+| `-out` | `report_<时间戳>.html` | 配合 `-once`：输出的 HTML 文件路径 |
+| `-since` | 不限制 | 配合 `-once`：只统计最近这段时间，如 `24h`、`168h` |
+| `-from` / `-to` | 不限制 | 配合 `-once`：统计范围起点（含）/ 终点（不含），格式 `2006-01-02` 或完整时间戳 |
+
+**HTTP 接口与查询参数**
+
+| 路由 | 说明 |
+|---|---|
+| `GET /` | HTML 看板页面 |
+| `GET /report` | 同一份报表数据的 JSON 输出（便于二次对接） |
+| `GET /healthz` | 存活探针，返回 `ok` |
+
+查询参数（`/` 与 `/report` 通用）：`?since=168h` 或 `?from=2026-09-01&to=2026-09-08`（两者互斥）统计时间范围，`?top=20` 调整 Top 列表条数。页面顶部提供 24 小时 / 7 天 / 30 天 / 全部 的快捷切换。参数非法返回 `400`。
+
+> 看板只读打开数据库（DSN 带 `mode=ro`），并在启动时校验 `connections` 表存在——路径写错、库文件不存在会直接报错退出，不会静默创建空库。报表结果按时间范围缓存，TTL 等于 `-refresh`，避免频繁刷新反复扫盘。
+
+**部署（systemd）**
+
+看板通常与蜜罐同机部署、指向同一个 `data/honeypot.db`：
+
+```ini
+# /etc/systemd/system/honeypot-report.service
+[Unit]
+Description=Honeypot Web Report Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=honeypot
+WorkingDirectory=/opt/honeypot
+ExecStart=/opt/honeypot/report-linux-amd64 -db /opt/honeypot/data/honeypot.db -listen 127.0.0.1:8080
+Restart=always
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/honeypot/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+默认只监听 `127.0.0.1`。若要从别的机器访问，建议用 Nginx/Caddy 反向代理并加一层认证（如 basic auth / mTLS），而不是直接把 `-listen` 改成 `0.0.0.0` 裸奔到公网——看板会展示攻击者提交的密码原文等敏感数据。
 
 ---
 
@@ -335,6 +406,7 @@ honeypot-go/
 │   ├── honeypot/        # 入口：装配、信号优雅退出
 │   ├── smoketest/       # 冒烟测试客户端
 │   ├── dbquery/         # SQLite 运营查询
+│   ├── report/          # Web 活动看板：只读数据库起 HTTP 服务
 │   ├── ttyshow/         # ttyrec 录制回放
 │   └── anti_attack/     # SSH 攻击反制：监听端口反弹回客户端源 IP 的同一端口
 ├── internal/
@@ -349,6 +421,7 @@ honeypot-go/
 │   ├── vnet/            # 虚拟网络仿真（wget/curl/ping/nc）
 │   ├── detect/          # 规则引擎 + 风险评分 + Webhook 告警
 │   ├── tty/             # ttyrec 录制
+│   ├── report/          # 活动报表聚合（SQL）与 HTML/JSON 渲染，供 cmd/report 看板使用
 │   └── store/           # SQLite + JSONL 持久化
 ├── configs/honeypot.yaml
 ├── scripts/             # 构建脚本（build-win.ps1 / build-linux.ps1）/ 冒烟测试

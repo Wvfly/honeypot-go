@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+{{if gt .RefreshSec 0}}<meta http-equiv="refresh" content="{{.RefreshSec}}">{{end}}
+<title>蜜罐活动看板{{if .DataFrom}} · {{.DataFrom}} ~ {{.DataTo}}{{end}}</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --border: #262b38; --text: #e6e8ee; --muted: #8b93a7;
+    --accent: #4f8cff; --ok: #3ecf8e; --low: #6b7a99; --medium: #e0a83e; --high: #e0703e; --critical: #e6484d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 64px; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; color: var(--text); margin: 0 0 12px; }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 28px; font-size: 13px; }
+  .toolbar .tb-label { color: var(--muted); font-size: 12px; }
+  .toolbar a {
+    color: var(--text); text-decoration: none; padding: 3px 12px;
+    border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+  }
+  .toolbar a:hover { border-color: var(--accent); }
+  .toolbar a.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(8, 1fr); gap: 12px; margin-bottom: 28px; }
+  @media (max-width: 1024px) { .cards { grid-template-columns: repeat(4, 1fr); } }
+  @media (max-width: 560px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .card .num { font-size: 24px; font-weight: 600; }
+  .card .label { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  td.wrap-cell { white-space: normal; word-break: break-all; }
+  tr:last-child td { border-bottom: none; }
+  .bar-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .bar-name { flex: 0 0 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .bar-track { flex: 1; background: #0d0f15; border-radius: 4px; height: 14px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--accent); border-radius: 4px; }
+  .bar-count { flex: 0 0 56px; text-align: right; color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; color: #0f1117; }
+  .badge.low { background: var(--low); color: #fff; }
+  .badge.medium { background: var(--medium); }
+  .badge.high { background: var(--high); color: #fff; }
+  .badge.critical { background: var(--critical); color: #fff; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .daybars { display: flex; align-items: flex-end; gap: 3px; height: 90px; }
+  .daybars .col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+  .daybars .col .fill { width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; }
+  .daybars .col .day-label { font-size: 10px; color: var(--muted); margin-top: 4px; writing-mode: vertical-rl; text-orientation: mixed; height: 46px; }
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 32px; }
+  footer .copy { margin-top: 4px; font-size: 11px; opacity: .8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>蜜罐活动看板</h1>
+  <div class="meta">
+    生成时间：{{.GeneratedAt.Format "2006-01-02 15:04:05"}}
+    {{if .DataFrom}} ｜ 数据范围：{{.DataFrom}} ~ {{.DataTo}}{{else}} ｜ 该时间范围内无数据{{end}}
+    {{if gt .RefreshSec 0}} ｜ 每 {{.RefreshSec}}s 自动刷新{{end}}
+  </div>
+
+  <div class="toolbar">
+    <span class="tb-label">统计范围：{{.RangeLabel}}</span>
+    {{range quickRanges}}<a href="/?since={{.Since}}{{if $.TopN}}&amp;top={{$.TopN}}{{end}}"{{if eq .Since $.Since}} class="active"{{end}}>{{.Label}}</a>{{end}}
+    <a href="/report?since={{.Since}}{{if .TopN}}&amp;top={{.TopN}}{{end}}">JSON</a>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="num">{{.TotalConnections}}</div><div class="label">连接总数</div></div>
+    <div class="card"><div class="num">{{.UniqueSourceIPs}}</div><div class="label">来源 IP 数</div></div>
+    <div class="card"><div class="num">{{.TotalAuthAttempts}}</div><div class="label">认证尝试</div></div>
+    <div class="card"><div class="num">{{.SuccessfulLogins}} <span style="font-size:12px;color:var(--muted)">({{pct .SuccessRate}})</span></div><div class="label">登录成功</div></div>
+    <div class="card"><div class="num">{{.TotalSessions}}</div><div class="label">会话数</div></div>
+    <div class="card"><div class="num">{{.TotalCommands}}</div><div class="label">执行命令数</div></div>
+    <div class="card"><div class="num">{{.TotalDownloads}}</div><div class="label">下载尝试</div></div>
+    <div class="card"><div class="num">{{.TotalAlerts}}</div><div class="label">告警总数</div></div>
+  </div>
+
+  <div class="grid2">
+    <section>
+      <h2>每日连接数</h2>
+      {{if .ConnectionsPerDay}}{{daybars .ConnectionsPerDay}}{{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+    <section>
+      <h2>每日告警数</h2>
+      {{if .AlertsPerDay}}{{daybars .AlertsPerDay}}{{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+  </div>
+
+  <section>
+    <h2>告警级别分布</h2>
+    {{if .AlertsBySeverity}}
+    <table>
+      <tr><th>级别</th><th class="num">次数</th></tr>
+      {{range $sev := severityOrder}}{{with index $.AlertsBySeverity $sev}}
+      <tr><td><span class="badge {{$sev}}">{{$sev}}</span></td><td class="num">{{.}}</td></tr>
+      {{end}}{{end}}
+    </table>
+    {{else}}<div class="empty">无告警</div>{{end}}
+  </section>
+
+  <div class="grid2">
+    <section>
+      <h2>来源 IP Top {{.Options.TopN}}</h2>
+      {{if .TopSourceIPs}}
+      <table>
+        <tr><th>IP</th><th class="num">连接数</th><th>首次</th><th>最近</th></tr>
+        {{range .TopSourceIPs}}
+        <tr><td>{{.SourceIP}}</td><td class="num">{{.Conns}}</td><td>{{.FirstSeen}}</td><td>{{.LastSeen}}</td></tr>
+        {{end}}
+      </table>
+      {{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+    <section>
+      <h2>命中最多的规则 Top {{.Options.TopN}}</h2>
+      {{if .TopRules}}{{bars .TopRules}}{{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section>
+      <h2>用户名 Top {{.Options.TopN}}</h2>
+      {{if .TopUsernames}}
+      <table>
+        <tr><th>用户名</th><th class="num">尝试</th><th class="num">成功</th></tr>
+        {{range .TopUsernames}}
+        <tr><td>{{.Value}}</td><td class="num">{{.Attempts}}</td><td class="num">{{.Successes}}</td></tr>
+        {{end}}
+      </table>
+      {{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+    <section>
+      <h2>密码 Top {{.Options.TopN}}</h2>
+      {{if .TopPasswords}}
+      <table>
+        <tr><th>密码</th><th class="num">尝试</th><th class="num">成功</th></tr>
+        {{range .TopPasswords}}
+        <tr><td>{{.Value}}</td><td class="num">{{.Attempts}}</td><td class="num">{{.Successes}}</td></tr>
+        {{end}}
+      </table>
+      {{else}}<div class="empty">无数据</div>{{end}}
+    </section>
+  </div>
+
+  <section>
+    <h2>执行命令 Top {{.Options.TopN}}</h2>
+    {{if .TopCommands}}{{bars .TopCommands}}{{else}}<div class="empty">无数据</div>{{end}}
+  </section>
+
+  <section>
+    <h2>下载 URL Top {{.Options.TopN}}</h2>
+    {{if .TopDownloads}}
+    <table>
+      <tr><th class="wrap-cell">URL</th><th class="num">次数</th></tr>
+      {{range .TopDownloads}}
+      <tr><td class="wrap-cell">{{.Name}}</td><td class="num">{{.Count}}</td></tr>
+      {{end}}
+    </table>
+    {{else}}<div class="empty">无数据</div>{{end}}
+  </section>
+
+  <section>
+    <h2>最近告警（最多 {{.Options.TopN}} 条）</h2>
+    {{if .RecentAlerts}}
+    <table>
+      <tr><th>时间</th><th>级别</th><th>规则</th><th class="num">评分</th><th>来源 IP</th><th>连接</th><th class="wrap-cell">证据</th></tr>
+      {{range .RecentAlerts}}
+      <tr>
+        <td>{{.Time.Format "2006-01-02 15:04:05"}}</td>
+        <td><span class="badge {{.Severity}}">{{.Severity}}</span></td>
+        <td>{{.RuleName}}</td>
+        <td class="num">{{.Score}}</td>
+        <td>{{.SourceIP}}</td>
+        <td>{{shortID .ConnectionID}}</td>
+        <td class="wrap-cell">{{.Evidence}}</td>
+      </tr>
+      {{end}}
+    </table>
+    {{else}}<div class="empty">无告警</div>{{end}}
+  </section>
+
+  <footer>
+    <div>honeypot-go report</div>
+    <div class="copy">© {{.GeneratedAt.Format "2006"}} Wvfly · 本项目以 GNU GPL-3.0 发布</div>
+  </footer>
+</div>
+</body>
+</html>
